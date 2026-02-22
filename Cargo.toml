@@ -1,0 +1,21 @@
+[package]
+name = "ccswitch"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-account switcher for Claude Code"
+authors = ["Vyshnav S Deepak <vyshnav.s.deepak@gmail.com>"]
+
+[[bin]]
+name = "ccswitch"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "color"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = "0.4"
+dirs = "5"
+colored = "2"
+ratatui = "0.29"
+crossterm = "0.28"
