@@ -17,6 +17,7 @@ use ratatui::{
 use std::io;
 
 use crate::{accounts, config, sequence};
+use crate::sequence::AuthKind;
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
@@ -25,7 +26,10 @@ enum Mode {
     ConfirmSwitch { num: u32, email: String },
     ConfirmRemove { num: u32, email: String },
     ConfirmAdd { email: String },
-    Done { message: String },
+    /// Switch (or other action) completed.
+    /// `needs_new_shell`: true when the active account is a token account —
+    /// the user must open a new shell for CLAUDE_CODE_OAUTH_TOKEN to update.
+    Done { needs_new_shell: bool },
 }
 
 struct Flash {
@@ -35,6 +39,8 @@ struct Flash {
 
 struct App {
     seq: sequence::SequenceFile,
+    /// Display email: prefers OAuth config, falls back to seq.active_account_number
+    /// so token users also see their active account in the header.
     current_email: Option<String>,
     selected: usize,
     mode: Mode,
@@ -45,7 +51,7 @@ struct App {
 impl App {
     fn new() -> Result<Self> {
         let seq = sequence::load()?;
-        let current_email = config::current_email();
+        let current_email = Self::resolve_display_email(&seq);
         Ok(App {
             seq,
             current_email,
@@ -58,7 +64,7 @@ impl App {
 
     fn reload(&mut self) -> Result<()> {
         self.seq = sequence::load()?;
-        self.current_email = config::current_email();
+        self.current_email = Self::resolve_display_email(&self.seq);
         // clamp selection
         if !self.seq.sequence.is_empty() && self.selected >= self.seq.sequence.len() {
             self.selected = self.seq.sequence.len() - 1;
@@ -66,14 +72,28 @@ impl App {
         Ok(())
     }
 
+    /// Determine the active email for display.
+    /// OAuth users: read from live Claude config.
+    /// Token users: fall back to the seq state (no oauthAccount in config).
+    fn resolve_display_email(seq: &sequence::SequenceFile) -> Option<String> {
+        config::current_email().or_else(|| {
+            seq.active_account_number
+                .and_then(|num| seq.accounts.get(&num.to_string()))
+                .map(|e| e.email.clone())
+        })
+    }
+
     fn selected_num(&self) -> Option<u32> {
         self.seq.sequence.get(self.selected).copied()
     }
 
     fn active_num(&self) -> Option<u32> {
-        self.current_email
-            .as_deref()
-            .and_then(|e| self.seq.find_by_email(e))
+        // Prefer seq state (works for token accounts that have no oauthAccount)
+        self.seq.active_account_number.or_else(|| {
+            self.current_email
+                .as_deref()
+                .and_then(|e| self.seq.find_by_email(e))
+        })
     }
 }
 
@@ -179,9 +199,15 @@ fn handle_normal(app: &mut App, key: KeyCode) -> Result<()> {
                     };
                 }
             } else {
+                // No oauthAccount detected. Token users must use the CLI.
+                let msg = if config::has_env_token() {
+                    "Token accounts: run  ccswitch add  in a terminal to set up".to_string()
+                } else {
+                    "No active Claude account found — log in to Claude Code first".to_string()
+                };
                 app.flash = Some(Flash {
-                    message: "No active Claude account found".to_string(),
-                    is_error: true,
+                    message: msg,
+                    is_error: !config::has_env_token(),
                 });
             }
         }
@@ -211,9 +237,16 @@ fn handle_confirm(app: &mut App, key: KeyCode) -> Result<()> {
             match mode {
                 Mode::ConfirmSwitch { num, email } => {
                     match accounts::core_switch(num) {
-                        Ok(msg) => {
+                        Ok(_) => {
                             app.reload()?;
-                            app.mode = Mode::Done { message: msg };
+                            // Token accounts require a new shell for the env var to update
+                            let needs_new_shell = app
+                                .seq
+                                .accounts
+                                .get(&num.to_string())
+                                .map(|e| e.auth_kind == AuthKind::Token)
+                                .unwrap_or(false);
+                            app.mode = Mode::Done { needs_new_shell };
                         }
                         Err(e) => {
                             app.flash = Some(Flash {
@@ -391,9 +424,10 @@ fn render_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             };
 
             let is_active = active_num == Some(num);
+            let is_token = entry.auth_kind == AuthKind::Token;
 
             if is_active {
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("  ▶  {:>2}  ", num),
                         Style::default()
@@ -406,21 +440,39 @@ fn render_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        "  active",
+                ];
+                if is_token {
+                    spans.push(Span::styled(
+                        "  [token]",
                         Style::default()
                             .fg(Color::Green)
                             .add_modifier(Modifier::DIM),
-                    ),
-                ]))
+                    ));
+                }
+                spans.push(Span::styled(
+                    "  active",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::DIM),
+                ));
+                ListItem::new(Line::from(spans))
             } else {
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("     {:>2}  ", num),
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(entry.email.clone(), Style::default().fg(Color::White)),
-                ]))
+                ];
+                if is_token {
+                    spans.push(Span::styled(
+                        "  [token]",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             }
         })
         .collect();
@@ -442,13 +494,13 @@ fn render_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 fn render_help(f: &mut ratatui::Frame, app: &App, area: Rect) {
     match &app.mode {
-        Mode::Done { message } => {
+        Mode::Done { needs_new_shell } => {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Green));
 
-            let text = Paragraph::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     "  ✓ Done  ·  ",
                     Style::default()
@@ -461,16 +513,24 @@ fn render_help(f: &mut ratatui::Frame, app: &App, area: Rect) {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    "  ·  [any key] quit",
-                    Style::default().fg(Color::Green),
-                ),
-            ]))
-            .block(block);
-            f.render_widget(text, area);
+            ];
 
-            // Also show the message in the area above as a flash
-            let _ = message;
+            if *needs_new_shell {
+                spans.push(Span::styled(
+                    "  ·  open a new shell",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            spans.push(Span::styled(
+                "  ·  [any key] quit",
+                Style::default().fg(Color::Green),
+            ));
+
+            let text = Paragraph::new(Line::from(spans)).block(block);
+            f.render_widget(text, area);
         }
         _ => {
             let block = Block::default()
