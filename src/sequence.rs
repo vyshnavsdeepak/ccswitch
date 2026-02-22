@@ -6,11 +6,21 @@ use std::{collections::HashMap, fs, io::Write, path::PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthKind {
+    #[default]
+    Oauth,
+    Token,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AccountEntry {
     pub email: String,
     pub uuid: String,
     pub added: String,
+    #[serde(default)]
+    pub auth_kind: AuthKind,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

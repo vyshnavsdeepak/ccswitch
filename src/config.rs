@@ -52,3 +52,15 @@ pub fn current_uuid() -> Option<String> {
             .map(String::from)
     })
 }
+
+/// True if CLAUDE_CODE_OAUTH_TOKEN env var is currently set (token-based auth).
+pub fn has_env_token() -> bool {
+    std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok()
+}
+
+/// Try to extract an email/label from a token string.
+/// Claude tokens (sk-ant-oat01-...) are opaque, so this returns None;
+/// the caller will prompt the user for a label.
+pub fn email_from_token(_token: &str) -> Option<String> {
+    None
+}
