@@ -153,8 +153,12 @@ pub(crate) fn core_remove(num: u32, email: &str) -> Result<String> {
 // ── Add current account ───────────────────────────────────────────────────────
 
 pub fn add() -> Result<()> {
-    // If no OAuth account is active, route to the interactive token flow
-    if config::current_email().is_none() {
+    // Route to the token flow when:
+    // 1. No oauthAccount in config (pure token user), OR
+    // 2. CLAUDE_CODE_OAUTH_TOKEN is set — the env var takes priority over the
+    //    credentials file, so even if a stale oauthAccount exists in config,
+    //    the user is effectively running in token mode.
+    if config::current_email().is_none() || config::has_env_token() {
         return token_add_flow();
     }
 
