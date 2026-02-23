@@ -187,11 +187,19 @@ fn token_add_flow() -> Result<()> {
     );
     println!();
 
-    // Prompt for the token with masked input
-    let token =
-        rpassword::prompt_password("  Paste your token (sk-ant-oat01-...): ")
-            .context("Failed to read token")?;
-    let token = token.trim().to_string();
+    // If the token is already in the environment, use it directly — no need to paste.
+    let token = if let Ok(env_token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
+        let t = env_token.trim().to_string();
+        if !t.is_empty() {
+            println!("  {} Using token from $CLAUDE_CODE_OAUTH_TOKEN.", "·".cyan());
+            println!();
+            t
+        } else {
+            prompt_token()?
+        }
+    } else {
+        prompt_token()?
+    };
 
     if token.is_empty() {
         bail!("No token provided.");
@@ -295,6 +303,12 @@ fn token_add_flow() -> Result<()> {
 
     println!();
     Ok(())
+}
+
+fn prompt_token() -> Result<String> {
+    let token = rpassword::prompt_password("  Paste your token (sk-ant-oat01-...): ")
+        .context("Failed to read token")?;
+    Ok(token.trim().to_string())
 }
 
 /// Generate a unique default label for a token account.
