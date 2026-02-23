@@ -1,49 +1,52 @@
 Output demo.gif
 
-Set Shell "zsh"
-Set FontSize 15
+Set FontSize 13
 Set Width 700
-Set Height 400
-Set Theme "Dracula"
-Set Padding 24
-Set TypingSpeed 70ms
+Set Height 380
+Set Theme "Catppuccin Mocha"
+Set Shell zsh
+Set Padding 20
+Set TypingSpeed 60ms
 Set PlaybackSpeed 0.85
+Set LoopOffset 5%
 
-Env PATH "/Users/vyshnav/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-Env PROMPT "%F{magenta}❯%f "
+# vhs spawns a non-login zsh — inject ~/.cargo/bin so ccswitch is found
+Env PATH "/Users/vyshnav/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin"
 
-Sleep 800ms
-
-# ── list accounts ─────────────────────────────────────────────────────────────
-Type "ccswitch list"
-Sleep 500ms
+# Open TUI
+Type "ccswitch"
 Enter
-Sleep 2.2s
+Sleep 2s                    # let TUI fully render
 
-# ── status ────────────────────────────────────────────────────────────────────
-Type "ccswitch status"
-Sleep 500ms
+# Navigate to Account 2
+Down
+Sleep 700ms
+
+# Initiate switch — triggers ConfirmSwitch dialog
+Enter
+Sleep 800ms                 # let dialog render
+
+# Confirm — REQUIRED by tui.rs ConfirmSwitch handler
+Type "y"
+Sleep 1.5s                  # let Done screen render
+
+# Dismiss Done screen (any key)
+Enter
+Sleep 1s                    # pause before re-opening
+
+# Re-open TUI to show Account 2 is now active, switch back
+Type "ccswitch"
 Enter
 Sleep 2s
 
-# ── open TUI ──────────────────────────────────────────────────────────────────
-Type "ccswitch"
-Sleep 500ms
-Enter
-Sleep 1.8s
+Up                          # navigate back to Account 1
+Sleep 700ms
 
-# navigate the list
-Down
+Enter                       # ConfirmSwitch dialog
 Sleep 800ms
-Up
-Sleep 600ms
 
-# press enter to start a switch, then cancel
-Enter
+Type "y"                    # confirm
+Sleep 1.5s                  # Done screen
+
+Enter                       # dismiss
 Sleep 1s
-Escape
-Sleep 800ms
-
-# quit
-Ctrl+c
-Sleep 800ms
