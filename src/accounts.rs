@@ -205,6 +205,20 @@ fn token_add_flow() -> Result<()> {
         bail!("No token provided.");
     }
 
+    // Check whether this token is already managed (by value, not just label)
+    sequence::setup_dirs()?;
+    let mut seq = sequence::load()?;
+
+    if let Some((existing_num, existing_email)) = find_account_by_token(&seq, &token) {
+        println!(
+            "  {} This token is already managed as {} {}",
+            "·".yellow(),
+            existing_email.bold(),
+            format!("(Account {})", existing_num).dimmed()
+        );
+        return Ok(());
+    }
+
     // Try to extract an email hint from the token (opaque tokens → None)
     let email_hint = config::email_from_token(&token);
     let default_label = token_default_label();
@@ -223,10 +237,7 @@ fn token_add_flow() -> Result<()> {
         label
     };
 
-    // Set up dirs and check for duplicates
-    sequence::setup_dirs()?;
-    let mut seq = sequence::load()?;
-
+    // Check for duplicate label
     if seq.account_exists(&email) {
         bail!("Account {} is already managed.", email);
     }
@@ -588,6 +599,28 @@ fn do_switch(target_num: u32) -> Result<()> {
 }
 
 // ── Credential helpers ────────────────────────────────────────────────────────
+
+/// Check whether a token value is already stored in any managed account.
+/// Returns (account_num, email) if found.
+fn find_account_by_token(seq: &SequenceFile, token: &str) -> Option<(u32, String)> {
+    for &num in &seq.sequence {
+        let entry = match seq.accounts.get(&num.to_string()) {
+            Some(e) => e,
+            None => continue,
+        };
+        if entry.auth_kind != AuthKind::Token {
+            continue;
+        }
+        if let Ok(creds) = credentials::read_backup(num, &entry.email) {
+            if let Ok(stored) = extract_access_token(&creds) {
+                if stored == token {
+                    return Some((num, entry.email.clone()));
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Extract the raw token value from a credentials backup.
 /// Token accounts store: {"token": "sk-ant-..."}
