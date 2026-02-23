@@ -65,12 +65,14 @@ ccswitch add
 #   Add to ~/.zshrc:  source ~/.ccswitchrc
 #   Then open a new terminal.
 
-# 2. Add more token accounts by setting a different token and re-running:
-CLAUDE_CODE_OAUTH_TOKEN=sk-ant-... ccswitch add
+# 2. Add more token accounts — run ccswitch add again:
+ccswitch add
+# → if $CLAUDE_CODE_OAUTH_TOKEN is already managed, it prompts you to paste a different token
 
 # 3. Switch:
 ccswitch switch 2
-# → updates the active token + opens new shell for it to take effect
+# → updates the active token; the shell function in ~/.ccswitchrc refreshes
+#   CLAUDE_CODE_OAUTH_TOKEN in the current shell — no new terminal needed
 ```
 
 After the one-time `source ~/.ccswitchrc` in your shell profile, ccswitch manages `CLAUDE_CODE_OAUTH_TOKEN` on every switch automatically. `~/.zshrc` is never touched again.
@@ -134,9 +136,7 @@ Token accounts show a dim `[token]` badge. After switching to a token account, t
 | Account type | What to do |
 |---|---|
 | OAuth | Restart Claude Code |
-| Token | Restart Claude Code **and** open a new terminal |
-
-The new terminal picks up the updated `CLAUDE_CODE_OAUTH_TOKEN` sourced from `~/.ccswitchrc`.
+| Token | Restart Claude Code (current shell updates automatically if you sourced `~/.ccswitchrc`) |
 
 ---
 
@@ -147,9 +147,17 @@ On first token account add, ccswitch writes a small file:
 ```bash
 # Managed by ccswitch — do not edit manually
 export CLAUDE_CODE_OAUTH_TOKEN=$(security find-generic-password -s "ccswitch-active-token" -w 2>/dev/null)
+
+# Shell wrapper: refreshes CLAUDE_CODE_OAUTH_TOKEN in the current shell after every switch
+ccswitch() {
+  command ccswitch "$@"
+  local _tok
+  _tok=$(security find-generic-password -s "ccswitch-active-token" -w 2>/dev/null)
+  [ -n "$_tok" ] && export CLAUDE_CODE_OAUTH_TOKEN="$_tok"
+}
 ```
 
-This file **never changes**. On every switch, ccswitch updates the `ccswitch-active-token` keychain entry it reads from. Source the file once in `~/.zshrc` and you're done.
+The `export` line sets the token when a new shell starts. The `ccswitch()` wrapper re-reads it after every switch so the **current shell** stays in sync — no new terminal needed. Source the file once in `~/.zshrc` and you're done. Existing users get the wrapper silently on the next `ccswitch add` or `ccswitch switch`.
 
 ---
 

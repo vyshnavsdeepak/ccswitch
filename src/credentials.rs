@@ -101,31 +101,55 @@ pub fn ccswitchrc_path() -> PathBuf {
         .join(".ccswitchrc")
 }
 
-/// Write ~/.ccswitchrc if it does not already exist.
-/// Returns true if the file was newly created (caller should show setup hint).
+fn ccswitchrc_content() -> &'static str {
+    match detect() {
+        Platform::MacOS => concat!(
+            "# Managed by ccswitch — do not edit manually\n",
+            "export CLAUDE_CODE_OAUTH_TOKEN=$(security find-generic-password",
+            " -s \"ccswitch-active-token\" -w 2>/dev/null)\n",
+            "\n",
+            "# Shell wrapper: refreshes CLAUDE_CODE_OAUTH_TOKEN in the current shell after every switch\n",
+            "ccswitch() {\n",
+            "  command ccswitch \"$@\"\n",
+            "  local _tok\n",
+            "  _tok=$(security find-generic-password -s \"ccswitch-active-token\" -w 2>/dev/null)\n",
+            "  [ -n \"$_tok\" ] && export CLAUDE_CODE_OAUTH_TOKEN=\"$_tok\"\n",
+            "}\n",
+        ),
+        Platform::Linux | Platform::Wsl => concat!(
+            "# Managed by ccswitch — do not edit manually\n",
+            "export CLAUDE_CODE_OAUTH_TOKEN=$(cat ~/.claude-switch-backup/active-token 2>/dev/null)\n",
+            "\n",
+            "ccswitch() {\n",
+            "  command ccswitch \"$@\"\n",
+            "  local _tok\n",
+            "  _tok=$(cat ~/.claude-switch-backup/active-token 2>/dev/null)\n",
+            "  [ -n \"$_tok\" ] && export CLAUDE_CODE_OAUTH_TOKEN=\"$_tok\"\n",
+            "}\n",
+        ),
+    }
+}
+
+/// Write ~/.ccswitchrc if it does not exist, or upgrade it if it lacks the shell wrapper.
+/// Returns true only when the file is newly created (caller should show setup hint).
 pub fn ensure_ccswitchrc() -> Result<bool> {
     let path = ccswitchrc_path();
-    if path.exists() {
-        return Ok(false);
+
+    if !path.exists() {
+        fs::write(&path, ccswitchrc_content())
+            .with_context(|| format!("Cannot write {}", path.display()))?;
+        return Ok(true);
     }
 
-    let content = match detect() {
-        Platform::MacOS => {
-            "# Managed by ccswitch — do not edit manually\n\
-             export CLAUDE_CODE_OAUTH_TOKEN=$(security find-generic-password \
-             -s \"ccswitch-active-token\" -w 2>/dev/null)\n"
-        }
-        Platform::Linux | Platform::Wsl => {
-            "# Managed by ccswitch — do not edit manually\n\
-             export CLAUDE_CODE_OAUTH_TOKEN=$(cat \
-             ~/.claude-switch-backup/active-token 2>/dev/null)\n"
-        }
-    };
+    // Silently upgrade files that pre-date the shell-function feature.
+    let existing = fs::read_to_string(&path)
+        .with_context(|| format!("Cannot read {}", path.display()))?;
+    if !existing.contains("command ccswitch") {
+        fs::write(&path, ccswitchrc_content())
+            .with_context(|| format!("Cannot write {}", path.display()))?;
+    }
 
-    fs::write(&path, content)
-        .with_context(|| format!("Cannot write {}", path.display()))?;
-
-    Ok(true)
+    Ok(false)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

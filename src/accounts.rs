@@ -209,15 +209,32 @@ fn token_add_flow() -> Result<()> {
     sequence::setup_dirs()?;
     let mut seq = sequence::load()?;
 
-    if let Some((existing_num, existing_email)) = find_account_by_token(&seq, &token) {
+    let token = if let Some((existing_num, existing_email)) = find_account_by_token(&seq, &token) {
         println!(
-            "  {} This token is already managed as {} {}",
+            "  {} Already managed as {} {}",
             "·".yellow(),
             existing_email.bold(),
             format!("(Account {})", existing_num).dimmed()
         );
-        return Ok(());
-    }
+        println!();
+        let new = rpassword::prompt_password(
+            "  Paste a different token to add another account (Enter to cancel): ",
+        )?;
+        let new = new.trim().to_string();
+        if new.is_empty() {
+            return Ok(());
+        }
+        if let Some((n2, e2)) = find_account_by_token(&seq, &new) {
+            bail!(
+                "That token is also already managed as {} (Account {}).",
+                e2,
+                n2
+            );
+        }
+        new
+    } else {
+        token
+    };
 
     // Try to extract an email hint from the token (opaque tokens → None)
     let email_hint = config::email_from_token(&token);
