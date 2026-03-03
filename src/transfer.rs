@@ -188,6 +188,10 @@ pub fn import() -> Result<()> {
     credentials::write_live(&active_acct.credentials)
         .context("Failed to write live credentials")?;
 
+    // Ensure ~/.ccswitchrc is present so CLAUDE_CODE_OAUTH_TOKEN is unset in
+    // new shells — mirrors what do_switch() does after every account activation.
+    let _ = credentials::ensure_ccswitchrc();
+
     // Merge oauthAccount from config backup into ~/.claude/.claude.json.
     // On a fresh VM neither ~/.claude/.claude.json nor ~/.claude.json exist yet,
     // so config::load() would fail.  Fall back to an empty object so oauthAccount
