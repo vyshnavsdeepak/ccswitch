@@ -4,6 +4,7 @@ mod credentials;
 mod platform;
 mod sequence;
 mod tui;
+mod update;
 
 #[cfg(test)]
 pub(crate) mod test_utils {
@@ -125,6 +126,9 @@ enum Commands {
 
     /// Run health checks on all managed accounts and configuration
     Doctor,
+
+    /// Update ccswitch to the latest release
+    Update,
 }
 
 fn main() {
@@ -166,5 +170,6 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Commands::Doctor) => accounts::doctor(),
+        Some(Commands::Update) => update::update(),
     }
 }
