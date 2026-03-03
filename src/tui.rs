@@ -44,6 +44,8 @@ struct App {
     mode: Mode,
     flash: Option<Flash>,
     quit: bool,
+    /// Set when the token add flow should run after the current event is processed.
+    pending_token_add: bool,
 }
 
 impl App {
@@ -57,6 +59,7 @@ impl App {
             mode: Mode::Normal,
             flash: None,
             quit: false,
+            pending_token_add: false,
         })
     }
 
@@ -128,6 +131,13 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
             break;
         }
 
+        // Run the interactive token add flow outside of raw/alternate-screen mode.
+        if app.pending_token_add {
+            app.pending_token_add = false;
+            run_token_add(terminal, &mut app)?;
+            continue; // redraw immediately after returning
+        }
+
         if !event::poll(std::time::Duration::from_millis(250))? {
             continue;
         }
@@ -149,6 +159,36 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
             }
         }
     }
+    Ok(())
+}
+
+/// Temporarily suspend the TUI, run the interactive token add flow, then restore.
+fn run_token_add(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+
+    let result = accounts::add();
+
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        crossterm::cursor::Hide
+    )?;
+    terminal.clear()?;
+
+    app.reload()?;
+    if let Err(e) = result {
+        app.flash = Some(Flash {
+            message: format!("Add failed: {}", e),
+            is_error: true,
+        });
+    }
+
     Ok(())
 }
 
@@ -196,16 +236,9 @@ fn handle_normal(app: &mut App, key: KeyCode) -> Result<()> {
                     };
                 }
             } else {
-                // No oauthAccount detected. Token users must use the CLI.
-                let msg = if config::has_env_token() {
-                    "Token accounts: run  ccswitch add  in a terminal to set up".to_string()
-                } else {
-                    "No active Claude account found — log in to Claude Code first".to_string()
-                };
-                app.flash = Some(Flash {
-                    message: msg,
-                    is_error: !config::has_env_token(),
-                });
+                // No OAuth account — suspend TUI and run the interactive add flow
+                // (covers token accounts and fresh installs where the user pastes a token).
+                app.pending_token_add = true;
             }
         }
         KeyCode::Char('d') | KeyCode::Delete => {
