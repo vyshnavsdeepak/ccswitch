@@ -747,6 +747,23 @@ fn do_switch(target_num: u32) -> Result<()> {
         "✓".green().bold()
     );
 
+    // Warn if CLAUDE_CODE_OAUTH_TOKEN is set — it overrides the keychain and
+    // will cause Claude Code to ignore the switch until it is cleared.
+    if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok() {
+        let rc = credentials::ccswitchrc_path();
+        println!(
+            "  {} {} is set in this shell.",
+            "!".yellow().bold(),
+            "CLAUDE_CODE_OAUTH_TOKEN".yellow().bold(),
+        );
+        println!(
+            "  {} Run {} or {} to clear it before restarting Claude Code.\n",
+            " ".normal(),
+            "unset CLAUDE_CODE_OAUTH_TOKEN".cyan().bold(),
+            format!("source {}", rc.display()).cyan(),
+        );
+    }
+
     Ok(())
 }
 
