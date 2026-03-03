@@ -18,6 +18,10 @@ impl std::fmt::Display for Platform {
 }
 
 pub fn detect() -> Platform {
+    #[cfg(test)]
+    if std::env::var("CCSWITCH_TEST_PLATFORM").as_deref() == Ok("linux") {
+        return Platform::Linux;
+    }
     match std::env::consts::OS {
         "macos" => Platform::MacOS,
         "linux" => {

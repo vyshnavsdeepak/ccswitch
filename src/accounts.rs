@@ -854,3 +854,301 @@ fn session_expiry_badge(creds_json: &str) -> String {
         _ => String::new(),
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        sequence::{AccountEntry, AuthKind, SequenceFile},
+        test_utils::TestEnv,
+    };
+    use std::fs;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn make_oauth_creds(label: &str) -> String {
+        let expires = chrono::Utc::now().timestamp_millis() + 30 * 24 * 3600 * 1000_i64;
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": format!("sk-ant-oat01-{}", label),
+                "refreshToken": format!("sk-ant-ort01-{}", label),
+                "expiresAt": expires
+            }
+        })
+        .to_string()
+    }
+
+    fn make_token_backup(token: &str) -> String {
+        serde_json::json!({ "token": token }).to_string()
+    }
+
+    fn make_oauth_config(email: &str, uuid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "oauthAccount": { "emailAddress": email, "accountUuid": uuid },
+            "numStartups": 1
+        })
+    }
+
+    fn write_live_file(env: &TestEnv, creds: &str) {
+        fs::write(env.dir.path().join(".credentials.json"), creds).unwrap();
+    }
+
+    fn write_config_file(env: &TestEnv, config: &serde_json::Value) {
+        fs::write(
+            env.dir.path().join(".claude.json"),
+            serde_json::to_string_pretty(config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn read_live_json(env: &TestEnv) -> serde_json::Value {
+        let raw = fs::read_to_string(env.dir.path().join(".credentials.json")).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn read_config_json(env: &TestEnv) -> serde_json::Value {
+        let raw = fs::read_to_string(env.dir.path().join(".claude.json")).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn entry(email: &str, kind: AuthKind) -> AccountEntry {
+        AccountEntry {
+            email: email.to_string(),
+            uuid: format!("uuid-{email}"),
+            added: sequence::now_utc(),
+            auth_kind: kind,
+        }
+    }
+
+    /// Two OAuth accounts, account 1 active.
+    fn setup_two_oauth(env: &TestEnv) {
+        let creds1 = make_oauth_creds("acct1");
+        let creds2 = make_oauth_creds("acct2");
+        let cfg1 = make_oauth_config("acct1@test.com", "uuid1");
+        let cfg2 = make_oauth_config("acct2@test.com", "uuid2");
+
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), entry("acct1@test.com", AuthKind::Oauth));
+        seq.accounts.insert("2".into(), entry("acct2@test.com", AuthKind::Oauth));
+        seq.sequence = vec![1, 2];
+        seq.active_account_number = Some(1);
+        seq.last_updated = sequence::now_utc();
+        sequence::save(&seq).unwrap();
+
+        write_live_file(env, &creds1);
+        write_config_file(env, &cfg1);
+
+        // Backup for account 2
+        credentials::write_backup(2, "acct2@test.com", &creds2).unwrap();
+        fs::write(
+            config_backup_path(2, "acct2@test.com"),
+            serde_json::to_string_pretty(&cfg2).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // ── Unit tests ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_access_token_ok() {
+        let creds = r#"{"token": "sk-ant-oat01-mytoken"}"#;
+        assert_eq!(extract_access_token(creds).unwrap(), "sk-ant-oat01-mytoken");
+    }
+
+    #[test]
+    fn test_extract_access_token_missing() {
+        let creds = r#"{"claudeAiOauth": {"accessToken": "tok"}}"#;
+        assert!(extract_access_token(creds).is_err());
+    }
+
+    #[test]
+    fn test_session_expiry_badge_expired() {
+        let ms = chrono::Utc::now().timestamp_millis() - 1_000;
+        let creds = serde_json::json!({ "claudeAiOauth": { "expiresAt": ms } }).to_string();
+        assert_eq!(session_expiry_badge(&creds), "[expired]");
+    }
+
+    #[test]
+    fn test_session_expiry_badge_hours() {
+        let ms = chrono::Utc::now().timestamp_millis() + 2 * 3600 * 1000_i64;
+        let creds = serde_json::json!({ "claudeAiOauth": { "expiresAt": ms } }).to_string();
+        assert_eq!(session_expiry_badge(&creds), "[~2h]");
+    }
+
+    #[test]
+    fn test_session_expiry_badge_days() {
+        let ms = chrono::Utc::now().timestamp_millis() + 4 * 86400 * 1000_i64;
+        let creds = serde_json::json!({ "claudeAiOauth": { "expiresAt": ms } }).to_string();
+        assert_eq!(session_expiry_badge(&creds), "[~4d]");
+    }
+
+    #[test]
+    fn test_session_expiry_badge_healthy() {
+        let ms = chrono::Utc::now().timestamp_millis() + 30 * 86400 * 1000_i64;
+        let creds = serde_json::json!({ "claudeAiOauth": { "expiresAt": ms } }).to_string();
+        assert_eq!(session_expiry_badge(&creds), "");
+    }
+
+    // ── Integration tests: core_switch ────────────────────────────────────────
+
+    #[test]
+    fn test_switch_already_active() {
+        let env = TestEnv::new();
+        setup_two_oauth(&env);
+
+        let msg = core_switch(1).unwrap();
+        assert!(msg.contains("Already using"), "unexpected: {msg}");
+        // Sequence unchanged
+        assert_eq!(sequence::load().unwrap().active_account_number, Some(1));
+    }
+
+    #[test]
+    fn test_switch_nonexistent_account() {
+        let env = TestEnv::new();
+        setup_two_oauth(&env);
+
+        let err = core_switch(99).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_switch_oauth_to_oauth() {
+        let env = TestEnv::new();
+        setup_two_oauth(&env);
+
+        let msg = core_switch(2).unwrap();
+        assert!(msg.contains("acct2@test.com"), "unexpected: {msg}");
+
+        // Sequence points at account 2
+        assert_eq!(sequence::load().unwrap().active_account_number, Some(2));
+
+        // Live credentials are account 2's token
+        let live = read_live_json(&env);
+        assert_eq!(
+            live["claudeAiOauth"]["accessToken"].as_str().unwrap(),
+            "sk-ant-oat01-acct2"
+        );
+
+        // Live config oauthAccount is account 2
+        let cfg = read_config_json(&env);
+        assert_eq!(
+            cfg["oauthAccount"]["emailAddress"].as_str().unwrap(),
+            "acct2@test.com"
+        );
+    }
+
+    #[test]
+    fn test_switch_oauth_to_token() {
+        let env = TestEnv::new();
+
+        let creds1 = make_oauth_creds("acct1");
+        let cfg1 = make_oauth_config("acct1@test.com", "uuid1");
+        let token2 = "sk-ant-oat01-tokenacct2";
+
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), entry("acct1@test.com", AuthKind::Oauth));
+        seq.accounts.insert("2".into(), entry("tokenuser", AuthKind::Token));
+        seq.sequence = vec![1, 2];
+        seq.active_account_number = Some(1);
+        seq.last_updated = sequence::now_utc();
+        sequence::save(&seq).unwrap();
+
+        write_live_file(&env, &creds1);
+        write_config_file(&env, &cfg1);
+        credentials::write_backup(2, "tokenuser", &make_token_backup(token2)).unwrap();
+
+        let msg = core_switch(2).unwrap();
+        assert!(msg.contains("tokenuser"), "unexpected: {msg}");
+
+        // Sequence points at account 2
+        assert_eq!(sequence::load().unwrap().active_account_number, Some(2));
+
+        // Live credentials contain the raw token as the OAuth accessToken
+        let live = read_live_json(&env);
+        assert_eq!(live["claudeAiOauth"]["accessToken"].as_str().unwrap(), token2);
+
+        // oauthAccount is removed from config
+        let cfg = read_config_json(&env);
+        assert!(cfg.get("oauthAccount").is_none(), "oauthAccount should be absent");
+    }
+
+    #[test]
+    fn test_switch_token_to_oauth() {
+        let env = TestEnv::new();
+
+        let token1 = "sk-ant-oat01-mytokenacct";
+        let creds2 = make_oauth_creds("acct2");
+        let cfg2 = make_oauth_config("acct2@test.com", "uuid2");
+
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), entry("tokenuser", AuthKind::Token));
+        seq.accounts.insert("2".into(), entry("acct2@test.com", AuthKind::Oauth));
+        seq.sequence = vec![1, 2];
+        seq.active_account_number = Some(1);
+        seq.last_updated = sequence::now_utc();
+        sequence::save(&seq).unwrap();
+
+        // Live credentials: token stored in OAuth format (as write_live_token would do)
+        let live_token_creds = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": token1,
+                "refreshToken": "",
+                "expiresAt": chrono::Utc::now().timestamp_millis() + 10 * 365 * 24 * 3600 * 1000_i64
+            }
+        })
+        .to_string();
+        write_live_file(&env, &live_token_creds);
+        write_config_file(&env, &serde_json::json!({ "numStartups": 1 }));
+
+        // Backup for account 2
+        credentials::write_backup(2, "acct2@test.com", &creds2).unwrap();
+        fs::write(
+            config_backup_path(2, "acct2@test.com"),
+            serde_json::to_string_pretty(&cfg2).unwrap(),
+        )
+        .unwrap();
+
+        let msg = core_switch(2).unwrap();
+        assert!(msg.contains("acct2@test.com"), "unexpected: {msg}");
+
+        // Sequence points at account 2
+        assert_eq!(sequence::load().unwrap().active_account_number, Some(2));
+
+        // Live credentials are account 2's OAuth token
+        let live = read_live_json(&env);
+        assert_eq!(
+            live["claudeAiOauth"]["accessToken"].as_str().unwrap(),
+            "sk-ant-oat01-acct2"
+        );
+
+        // Live config now has account 2's oauthAccount
+        let cfg = read_config_json(&env);
+        assert_eq!(
+            cfg["oauthAccount"]["emailAddress"].as_str().unwrap(),
+            "acct2@test.com"
+        );
+    }
+
+    #[test]
+    fn test_switch_oauth_to_oauth_snapshots_current() {
+        let env = TestEnv::new();
+        setup_two_oauth(&env);
+
+        // Switch to account 2
+        core_switch(2).unwrap();
+
+        // Now switch back to account 1 — its backup should have been written
+        // when we switched away from it
+        core_switch(1).unwrap();
+
+        // Live creds should be back to account 1's token
+        let live = read_live_json(&env);
+        assert_eq!(
+            live["claudeAiOauth"]["accessToken"].as_str().unwrap(),
+            "sk-ant-oat01-acct1"
+        );
+        assert_eq!(sequence::load().unwrap().active_account_number, Some(1));
+    }
+}

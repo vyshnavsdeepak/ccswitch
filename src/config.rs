@@ -5,6 +5,10 @@ use std::{fs, path::PathBuf};
 /// Find the active Claude config file: prefers ~/.claude/.claude.json if it has
 /// an oauthAccount, falls back to ~/.claude.json.
 pub fn path() -> PathBuf {
+    #[cfg(test)]
+    if let Ok(dir) = std::env::var("CCSWITCH_TEST_DIR") {
+        return std::path::PathBuf::from(dir).join(".claude.json");
+    }
     let home = dirs::home_dir().expect("Cannot find home directory");
     let primary = home.join(".claude").join(".claude.json");
     let fallback = home.join(".claude.json");

@@ -5,6 +5,37 @@ mod platform;
 mod sequence;
 mod tui;
 
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use std::sync::Mutex;
+
+    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub struct TestEnv {
+        pub dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestEnv {
+        pub fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::TempDir::new().unwrap();
+            std::env::set_var("CCSWITCH_TEST_DIR", dir.path().to_str().unwrap());
+            std::env::set_var("CCSWITCH_TEST_PLATFORM", "linux");
+            std::fs::create_dir_all(dir.path().join("configs")).unwrap();
+            std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
+            TestEnv { dir, _lock: lock }
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("CCSWITCH_TEST_DIR");
+            std::env::remove_var("CCSWITCH_TEST_PLATFORM");
+        }
+    }
+}
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::Colorize;

@@ -33,9 +33,11 @@ pub fn write_live(credentials: &str) -> Result<()> {
     match detect() {
         Platform::MacOS => keychain_write("Claude Code-credentials", credentials),
         Platform::Linux | Platform::Wsl => {
-            let dir = dirs::home_dir().unwrap().join(".claude");
-            fs::create_dir_all(&dir)?;
-            write_file_600(&dir.join(".credentials.json"), credentials)
+            let path = creds_file_path();
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            write_file_600(&path, credentials)
         }
     }
 }
@@ -286,6 +288,10 @@ fn account_service(num: u32, email: &str) -> String {
 }
 
 fn creds_file_path() -> PathBuf {
+    #[cfg(test)]
+    if let Ok(dir) = std::env::var("CCSWITCH_TEST_DIR") {
+        return PathBuf::from(dir).join(".credentials.json");
+    }
     dirs::home_dir()
         .unwrap()
         .join(".claude")
@@ -347,4 +353,77 @@ fn write_file_600(path: &PathBuf, content: &str) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_oauth_creds(expires_at_ms: i64) -> String {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-test",
+                "refreshToken": "sk-ant-ort01-test",
+                "expiresAt": expires_at_ms
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_oauth_expires_at() {
+        let creds = make_oauth_creds(9_999_999_999_999);
+        assert_eq!(oauth_expires_at(&creds), Some(9_999_999_999_999));
+    }
+
+    #[test]
+    fn test_oauth_expires_at_missing() {
+        let creds = r#"{"claudeAiOauth": {"accessToken": "tok"}}"#;
+        assert_eq!(oauth_expires_at(creds), None);
+    }
+
+    #[test]
+    fn test_oauth_expires_at_non_oauth() {
+        let creds = r#"{"token": "sk-ant-oat01-abc"}"#;
+        assert_eq!(oauth_expires_at(creds), None);
+    }
+
+    #[test]
+    fn test_is_oauth_active_future() {
+        let ms = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        assert!(is_oauth_active(&make_oauth_creds(ms)));
+    }
+
+    #[test]
+    fn test_is_oauth_active_past() {
+        let ms = chrono::Utc::now().timestamp_millis() - 1_000;
+        assert!(!is_oauth_active(&make_oauth_creds(ms)));
+    }
+
+    #[test]
+    fn test_is_oauth_active_no_expiry() {
+        // No expiresAt field → treated as active
+        let creds = r#"{"claudeAiOauth": {"accessToken": "tok"}}"#;
+        assert!(is_oauth_active(creds));
+    }
+
+    #[test]
+    fn test_oauth_secs_remaining_positive() {
+        let ms = chrono::Utc::now().timestamp_millis() + 3_600_000; // +1h
+        let secs = oauth_secs_remaining(&make_oauth_creds(ms)).unwrap();
+        assert!(secs > 3500 && secs <= 3600, "expected ~3600, got {secs}");
+    }
+
+    #[test]
+    fn test_oauth_secs_remaining_negative() {
+        let ms = chrono::Utc::now().timestamp_millis() - 3_600_000; // -1h
+        let secs = oauth_secs_remaining(&make_oauth_creds(ms)).unwrap();
+        assert!(secs < 0, "expected negative, got {secs}");
+    }
+
+    #[test]
+    fn test_oauth_secs_remaining_none_for_token() {
+        let creds = r#"{"token": "sk-ant-oat01-abc"}"#;
+        assert_eq!(oauth_secs_remaining(creds), None);
+    }
 }

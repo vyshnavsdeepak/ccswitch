@@ -72,6 +72,10 @@ pub fn now_utc() -> String {
 }
 
 pub fn backup_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Ok(dir) = std::env::var("CCSWITCH_TEST_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .expect("Cannot find home directory")
         .join(".claude-switch-backup")
@@ -135,4 +139,93 @@ pub fn write_atomic(path: &PathBuf, content: &str) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_entry(email: &str) -> AccountEntry {
+        AccountEntry {
+            email: email.to_string(),
+            uuid: "test-uuid".to_string(),
+            added: now_utc(),
+            auth_kind: AuthKind::Oauth,
+        }
+    }
+
+    #[test]
+    fn test_next_account_number_empty() {
+        let seq = SequenceFile::default();
+        assert_eq!(seq.next_account_number(), 1);
+    }
+
+    #[test]
+    fn test_next_account_number_existing() {
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), make_entry("a@test.com"));
+        seq.accounts.insert("3".into(), make_entry("b@test.com"));
+        assert_eq!(seq.next_account_number(), 4);
+    }
+
+    #[test]
+    fn test_find_by_email_found() {
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("2".into(), make_entry("user@test.com"));
+        assert_eq!(seq.find_by_email("user@test.com"), Some(2));
+    }
+
+    #[test]
+    fn test_find_by_email_not_found() {
+        let seq = SequenceFile::default();
+        assert_eq!(seq.find_by_email("nobody@test.com"), None);
+    }
+
+    #[test]
+    fn test_account_exists() {
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), make_entry("user@test.com"));
+        assert!(seq.account_exists("user@test.com"));
+        assert!(!seq.account_exists("other@test.com"));
+    }
+
+    #[test]
+    fn test_resolve_by_number() {
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("5".into(), make_entry("user@test.com"));
+        assert_eq!(seq.resolve("5"), Some(5));
+        assert_eq!(seq.resolve("6"), None);
+    }
+
+    #[test]
+    fn test_resolve_by_email() {
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("3".into(), make_entry("user@test.com"));
+        assert_eq!(seq.resolve("user@test.com"), Some(3));
+        assert_eq!(seq.resolve("other@test.com"), None);
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let _env = crate::test_utils::TestEnv::new();
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), make_entry("user@test.com"));
+        seq.sequence = vec![1];
+        seq.active_account_number = Some(1);
+        seq.last_updated = "2024-01-01T00:00:00Z".to_string();
+        save(&seq).unwrap();
+
+        let loaded = load().unwrap();
+        assert_eq!(loaded.active_account_number, Some(1));
+        assert_eq!(loaded.sequence, vec![1]);
+        assert_eq!(loaded.accounts["1"].email, "user@test.com");
+    }
+
+    #[test]
+    fn test_load_missing_returns_default() {
+        let _env = crate::test_utils::TestEnv::new();
+        let seq = load().unwrap();
+        assert!(seq.accounts.is_empty());
+        assert_eq!(seq.active_account_number, None);
+    }
 }
