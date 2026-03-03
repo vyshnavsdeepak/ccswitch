@@ -1237,6 +1237,322 @@ fn session_expiry_badge(creds_json: &str) -> String {
     }
 }
 
+// ── Doctor health check ───────────────────────────────────────────────────────
+
+/// Counts of issues and warnings found by a doctor run (used by tests).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct DoctorReport {
+    pub issues: usize,
+    pub warnings: usize,
+}
+
+/// Run all health checks and return counts without printing anything.
+/// Takes the already-loaded `SequenceFile` so tests can pass an in-memory value.
+pub(crate) fn core_doctor(seq: &SequenceFile) -> DoctorReport {
+    let mut report = DoctorReport::default();
+    const EXPIRE_SOON_SECS: i64 = 24 * 3600;
+
+    // 1. CLAUDE_CODE_OAUTH_TOKEN env var
+    if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok() {
+        report.warnings += 1;
+    }
+
+    // 2. sequence.json integrity
+    for &num in &seq.sequence {
+        if !seq.accounts.contains_key(&num.to_string()) {
+            report.issues += 1;
+        }
+    }
+    for num_str in seq.accounts.keys() {
+        let num: u32 = num_str.parse().unwrap_or(0);
+        if !seq.sequence.contains(&num) {
+            report.warnings += 1;
+        }
+    }
+
+    // 3 & 4. Credentials readable + token expiry
+    for &num in &seq.sequence {
+        let Some(entry) = seq.accounts.get(&num.to_string()) else {
+            continue;
+        };
+        let is_active = seq.active_account_number == Some(num);
+        let creds_result = if is_active {
+            credentials::read_live()
+        } else {
+            credentials::read_backup(num, &entry.email)
+        };
+
+        match creds_result {
+            Err(_) => report.issues += 1,
+            Ok(creds) if entry.auth_kind == AuthKind::Oauth => {
+                match credentials::oauth_secs_remaining(&creds) {
+                    Some(secs) if secs <= 0 => report.issues += 1,
+                    Some(secs) if secs <= EXPIRE_SOON_SECS => report.warnings += 1,
+                    _ => {}
+                }
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // 5. File permissions (Linux / WSL only)
+    #[cfg(unix)]
+    {
+        use crate::platform::{detect, Platform};
+        use std::os::unix::fs::PermissionsExt;
+
+        let platform = detect();
+        if platform == Platform::Linux || platform == Platform::Wsl {
+            let base = sequence::backup_dir();
+            let mut checks: Vec<(std::path::PathBuf, u32)> = vec![
+                (base.clone(), 0o700),
+                (base.join("configs"), 0o700),
+                (base.join("credentials"), 0o700),
+                (sequence::sequence_path(), 0o600),
+            ];
+            if let Ok(entries) = std::fs::read_dir(base.join("credentials")) {
+                for e in entries.flatten() {
+                    checks.push((e.path(), 0o600));
+                }
+            }
+            for (path, expected) in &checks {
+                if !path.exists() {
+                    continue;
+                }
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.permissions().mode() & 0o777 != *expected {
+                        report.issues += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    report
+}
+
+/// Print a health-check summary for all managed accounts and configuration.
+pub fn doctor() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    const EXPIRE_SOON_SECS: i64 = 24 * 3600;
+    let mut issues: usize = 0;
+    let mut warnings: usize = 0;
+
+    println!();
+
+    // ── 1. CLAUDE_CODE_OAUTH_TOKEN env var ────────────────────────────────────
+    if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok() {
+        println!(
+            "  {} CLAUDE_CODE_OAUTH_TOKEN is set — this overrides ccswitch and may break account switching",
+            "⚠".yellow().bold()
+        );
+        println!("    Unset it or add `source ~/.ccswitchrc` to your shell profile.");
+        warnings += 1;
+    } else {
+        println!("  {} CLAUDE_CODE_OAUTH_TOKEN not set", "✓".green().bold());
+    }
+
+    // ── Load sequence ─────────────────────────────────────────────────────────
+    let seq = sequence::load()?;
+
+    if seq.accounts.is_empty() {
+        println!(
+            "  {} No accounts managed yet — run `ccswitch add` first",
+            "⚠".yellow().bold()
+        );
+        println!();
+        return Ok(());
+    }
+
+    // ── 2. sequence.json integrity ────────────────────────────────────────────
+    let mut seq_ok = true;
+    for &num in &seq.sequence {
+        if !seq.accounts.contains_key(&num.to_string()) {
+            println!(
+                "  {} sequence.json references account {} but no account entry exists",
+                "✗".red().bold(),
+                num
+            );
+            issues += 1;
+            seq_ok = false;
+        }
+    }
+    for (num_str, entry) in &seq.accounts {
+        let num: u32 = num_str.parse().unwrap_or(0);
+        if !seq.sequence.contains(&num) {
+            println!(
+                "  {} Account {} ({}) is in accounts map but missing from sequence list",
+                "⚠".yellow().bold(),
+                num,
+                entry.email
+            );
+            warnings += 1;
+            seq_ok = false;
+        }
+    }
+    if seq_ok {
+        println!("  {} sequence.json integrity OK", "✓".green().bold());
+    }
+
+    // ── 3 & 4. Credentials readable + token expiry ────────────────────────────
+    for &num in &seq.sequence {
+        let Some(entry) = seq.accounts.get(&num.to_string()) else {
+            continue;
+        };
+        let is_active = seq.active_account_number == Some(num);
+        let creds_result = if is_active {
+            credentials::read_live()
+        } else {
+            credentials::read_backup(num, &entry.email)
+        };
+
+        match creds_result {
+            Err(e) => {
+                println!(
+                    "  {} Account {} ({}) — cannot read credentials: {}",
+                    "✗".red().bold(),
+                    num,
+                    entry.email,
+                    e
+                );
+                issues += 1;
+            }
+            Ok(creds) if entry.auth_kind == AuthKind::Oauth => {
+                match credentials::oauth_secs_remaining(&creds) {
+                    Some(secs) if secs <= 0 => {
+                        let hours = (-secs) / 3600;
+                        if hours > 0 {
+                            println!(
+                                "  {} Account {} ({}) — token expired {}h ago",
+                                "✗".red().bold(),
+                                num,
+                                entry.email,
+                                hours
+                            );
+                        } else {
+                            println!(
+                                "  {} Account {} ({}) — token expired {}m ago",
+                                "✗".red().bold(),
+                                num,
+                                entry.email,
+                                (-secs) / 60
+                            );
+                        }
+                        issues += 1;
+                    }
+                    Some(secs) if secs <= EXPIRE_SOON_SECS => {
+                        println!(
+                            "  {} Account {} ({}) — token expires in {}h (run `ccswitch refresh {}`)",
+                            "⚠".yellow().bold(),
+                            num,
+                            entry.email,
+                            secs / 3600,
+                            num
+                        );
+                        warnings += 1;
+                    }
+                    _ => {
+                        println!(
+                            "  {} Account {} ({}) — credentials OK",
+                            "✓".green().bold(),
+                            num,
+                            entry.email
+                        );
+                    }
+                }
+            }
+            Ok(_) => {
+                println!(
+                    "  {} Account {} ({}) — credentials OK (static token)",
+                    "✓".green().bold(),
+                    num,
+                    entry.email
+                );
+            }
+        }
+    }
+
+    // ── 5. File permissions (Linux / WSL only) ────────────────────────────────
+    #[cfg(unix)]
+    {
+        use crate::platform::{detect, Platform};
+
+        let platform = detect();
+        if platform == Platform::Linux || platform == Platform::Wsl {
+            let base = sequence::backup_dir();
+            let mut checks: Vec<(std::path::PathBuf, u32)> = vec![
+                (base.clone(), 0o700),
+                (base.join("configs"), 0o700),
+                (base.join("credentials"), 0o700),
+                (sequence::sequence_path(), 0o600),
+            ];
+            if let Ok(entries) = std::fs::read_dir(base.join("credentials")) {
+                for e in entries.flatten() {
+                    checks.push((e.path(), 0o600));
+                }
+            }
+            let mut perm_ok = true;
+            for (path, expected) in &checks {
+                if !path.exists() {
+                    continue;
+                }
+                match std::fs::metadata(path) {
+                    Err(e) => {
+                        println!(
+                            "  {} Cannot stat {}: {}",
+                            "✗".red().bold(),
+                            path.display(),
+                            e
+                        );
+                        issues += 1;
+                        perm_ok = false;
+                    }
+                    Ok(meta) => {
+                        let mode = meta.permissions().mode() & 0o777;
+                        if mode != *expected {
+                            println!(
+                                "  {} {} has permissions {:04o}, expected {:04o}",
+                                "✗".red().bold(),
+                                path.display(),
+                                mode,
+                                expected
+                            );
+                            issues += 1;
+                            perm_ok = false;
+                        }
+                    }
+                }
+            }
+            if perm_ok {
+                println!("  {} File permissions OK", "✓".green().bold());
+            }
+        }
+    }
+
+    // ── Summary ───────────────────────────────────────────────────────────────
+    println!();
+    if issues == 0 && warnings == 0 {
+        println!("  {} All checks passed.\n", "✓".green().bold());
+    } else {
+        let mut parts = Vec::new();
+        if issues > 0 {
+            parts.push(format!("{} error{}", issues, if issues == 1 { "" } else { "s" }));
+        }
+        if warnings > 0 {
+            parts.push(format!(
+                "{} warning{}",
+                warnings,
+                if warnings == 1 { "" } else { "s" }
+            ));
+        }
+        println!("  {} {}\n", "⚠".yellow().bold(), parts.join(", "));
+    }
+
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1779,6 +2095,167 @@ mod tests {
         let result = refresh(Some("1"), true);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("--all"));
+    }
+
+    // ── Tests: doctor ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_doctor_no_accounts_returns_zero_counts() {
+        let _env = TestEnv::new();
+        let seq = SequenceFile::default();
+        let report = core_doctor(&seq);
+        assert_eq!(report.issues, 0);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn test_doctor_env_var_set_warns() {
+        let _env = TestEnv::new();
+        std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "test-tok");
+        let seq = SequenceFile::default();
+        let report = core_doctor(&seq);
+        std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(report.warnings, 1, "CLAUDE_CODE_OAUTH_TOKEN should produce 1 warning");
+        assert_eq!(report.issues, 0);
+    }
+
+    #[test]
+    fn test_doctor_healthy_oauth_account() {
+        let _env = TestEnv::new();
+        let expires_ms = chrono::Utc::now().timestamp_millis() + 7 * 86400 * 1000_i64;
+        let creds = make_oauth_creds_with_expiry("healthy", expires_ms);
+
+        let mut seq = seq_with_accounts(&[(1, "user@test.com", AuthKind::Oauth)]);
+        seq.active_account_number = Some(1);
+        sequence::save(&seq).unwrap();
+        fs::write(_env.dir.path().join(".credentials.json"), &creds).unwrap();
+
+        let report = core_doctor(&seq);
+        assert_eq!(report.issues, 0, "healthy account should produce no issues");
+        // warnings may include perm issues in test env; just check no cred issues
+    }
+
+    #[test]
+    fn test_doctor_missing_credentials_is_issue() {
+        let _env = TestEnv::new();
+
+        let mut seq = seq_with_accounts(&[(1, "ghost@test.com", AuthKind::Oauth)]);
+        seq.active_account_number = Some(1);
+        // No credentials file written → read_live() will fail
+
+        let report = core_doctor(&seq);
+        assert!(report.issues >= 1, "missing credentials should produce at least 1 issue");
+    }
+
+    #[test]
+    fn test_doctor_expired_oauth_is_issue() {
+        let _env = TestEnv::new();
+        let expired_ms = chrono::Utc::now().timestamp_millis() - 3600 * 1000_i64;
+        let creds = make_oauth_creds_with_expiry("expired", expired_ms);
+
+        let mut seq = seq_with_accounts(&[(1, "expired@test.com", AuthKind::Oauth)]);
+        seq.active_account_number = Some(1);
+        sequence::save(&seq).unwrap();
+        fs::write(_env.dir.path().join(".credentials.json"), &creds).unwrap();
+
+        let report = core_doctor(&seq);
+        assert!(report.issues >= 1, "expired token should produce at least 1 issue");
+    }
+
+    #[test]
+    fn test_doctor_expiring_soon_is_warning() {
+        let _env = TestEnv::new();
+        let soon_ms = chrono::Utc::now().timestamp_millis() + 12 * 3600 * 1000_i64; // 12 h
+        let creds = make_oauth_creds_with_expiry("soon", soon_ms);
+
+        let mut seq = seq_with_accounts(&[(1, "soon@test.com", AuthKind::Oauth)]);
+        seq.active_account_number = Some(1);
+        sequence::save(&seq).unwrap();
+        fs::write(_env.dir.path().join(".credentials.json"), &creds).unwrap();
+
+        let report = core_doctor(&seq);
+        assert_eq!(report.issues, 0, "expiring-soon token should not be an issue");
+        // The warning count may include perm issues; verify at least 1 warning
+        assert!(report.warnings >= 1, "expiring-soon token should produce at least 1 warning");
+    }
+
+    #[test]
+    fn test_doctor_token_account_no_expiry_issue() {
+        let _env = TestEnv::new();
+        let token_creds = make_token_backup("sk-ant-tok01-test");
+
+        let mut seq = seq_with_accounts(&[(1, "tok@test.com", AuthKind::Token)]);
+        seq.active_account_number = Some(1);
+        sequence::save(&seq).unwrap();
+        // Write as live credentials (active account)
+        fs::write(_env.dir.path().join(".credentials.json"), &token_creds).unwrap();
+
+        let report = core_doctor(&seq);
+        // Token accounts never produce expiry issues
+        assert_eq!(report.issues, 0, "token account with readable creds should not be an issue");
+    }
+
+    #[test]
+    fn test_doctor_sequence_integrity_missing_entry() {
+        let _env = TestEnv::new();
+
+        // Sequence lists account 99 which has no entry in accounts map
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert(
+            "1".into(),
+            AccountEntry {
+                email: "user@test.com".to_string(),
+                uuid: "uuid-1".to_string(),
+                added: sequence::now_utc(),
+                auth_kind: AuthKind::Oauth,
+            },
+        );
+        seq.sequence = vec![1, 99]; // 99 has no entry
+        seq.active_account_number = Some(1);
+        seq.last_updated = sequence::now_utc();
+
+        let report = core_doctor(&seq);
+        assert!(report.issues >= 1, "dangling sequence entry should be an issue");
+    }
+
+    #[test]
+    fn test_doctor_account_not_in_sequence_is_warning() {
+        let _env = TestEnv::new();
+
+        // Account 2 is in accounts map but not in sequence list
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert(
+            "1".into(),
+            AccountEntry {
+                email: "a@test.com".to_string(),
+                uuid: "uuid-1".to_string(),
+                added: sequence::now_utc(),
+                auth_kind: AuthKind::Oauth,
+            },
+        );
+        seq.accounts.insert(
+            "2".into(),
+            AccountEntry {
+                email: "b@test.com".to_string(),
+                uuid: "uuid-2".to_string(),
+                added: sequence::now_utc(),
+                auth_kind: AuthKind::Token,
+            },
+        );
+        seq.sequence = vec![1]; // 2 is missing from sequence
+        seq.active_account_number = Some(1);
+        seq.last_updated = sequence::now_utc();
+
+        let report = core_doctor(&seq);
+        assert!(report.warnings >= 1, "account missing from sequence should be a warning");
+    }
+
+    #[test]
+    fn test_doctor_function_returns_ok() {
+        let _env = TestEnv::new();
+        // doctor() should always return Ok regardless of issues found
+        let result = doctor();
+        assert!(result.is_ok(), "doctor() should return Ok even with no accounts");
     }
 
     // ── Tests: core_edit_account ──────────────────────────────────────────────

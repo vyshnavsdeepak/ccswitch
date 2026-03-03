@@ -24,6 +24,15 @@ pub(crate) mod test_utils {
             std::env::set_var("CCSWITCH_TEST_PLATFORM", "linux");
             std::fs::create_dir_all(dir.path().join("configs")).unwrap();
             std::fs::create_dir_all(dir.path().join("credentials")).unwrap();
+            // Set 0o700 on the directories so doctor's permission check passes.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for sub in ["", "configs", "credentials"] {
+                    let p = dir.path().join(sub);
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+                }
+            }
             TestEnv { dir, _lock: lock }
         }
     }
@@ -113,6 +122,9 @@ enum Commands {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
+
+    /// Run health checks on all managed accounts and configuration
+    Doctor,
 }
 
 fn main() {
@@ -153,5 +165,6 @@ fn run() -> Result<()> {
             clap_complete::generate(shell, &mut Cli::command(), "ccswitch", &mut std::io::stdout());
             Ok(())
         }
+        Some(Commands::Doctor) => accounts::doctor(),
     }
 }
