@@ -483,6 +483,39 @@ pub fn remove(identifier: &str) -> Result<()> {
     Ok(())
 }
 
+// ── Alias ─────────────────────────────────────────────────────────────────────
+
+pub fn set_alias(account: &str, name: &str) -> Result<()> {
+    let mut seq = sequence::load()?;
+
+    if seq.accounts.is_empty() {
+        bail!("No accounts managed yet. Run `ccswitch add` first.");
+    }
+
+    let num = seq
+        .resolve(account)
+        .with_context(|| format!("No account found matching '{account}'"))?;
+
+    if let Some(&existing_num) = seq.aliases.get(name) {
+        bail!("Alias '{}' is already used by Account {}", name, existing_num);
+    }
+
+    let email = seq.accounts[&num.to_string()].email.clone();
+
+    seq.aliases.insert(name.to_string(), num);
+    seq.last_updated = sequence::now_utc();
+    sequence::save(&seq)?;
+
+    println!(
+        "\n  {} Alias '{}' → Account {} ({})\n",
+        "✓".green().bold(),
+        name,
+        num,
+        email
+    );
+    Ok(())
+}
+
 // ── List accounts ─────────────────────────────────────────────────────────────
 
 pub fn list() -> Result<()> {
@@ -501,6 +534,13 @@ pub fn list() -> Result<()> {
 
     println!("\n  {}", "Managed Accounts".bold());
     println!("  {}", "─".repeat(40).dimmed());
+
+    // Build reverse alias map: account_num -> alias name
+    let alias_for: std::collections::HashMap<u32, &str> = seq
+        .aliases
+        .iter()
+        .map(|(name, &num)| (num, name.as_str()))
+        .collect();
 
     for &num in &seq.sequence {
         let Some(entry) = seq.accounts.get(&num.to_string()) else {
@@ -527,12 +567,18 @@ pub fn list() -> Result<()> {
             ""
         };
 
+        let alias_badge = alias_for
+            .get(&num)
+            .map(|a| format!(" [{}]", a))
+            .unwrap_or_default();
+
         if is_active {
             print!(
-                "  {}  {}{}",
+                "  {}  {}{}{}",
                 format!("▶ {num:>2}").green().bold(),
                 entry.email.green().bold(),
                 kind_badge.green().dimmed(),
+                alias_badge.green().dimmed(),
             );
             if let Some(ref eb) = expiry_badge {
                 if eb.starts_with("[expired]") {
@@ -544,10 +590,11 @@ pub fn list() -> Result<()> {
             println!("  {}", "(active)".green().dimmed());
         } else {
             print!(
-                "  {}  {}{}",
+                "  {}  {}{}{}",
                 format!("  {num:>2}").dimmed(),
                 entry.email,
-                kind_badge.dimmed()
+                kind_badge.dimmed(),
+                alias_badge.dimmed(),
             );
             if let Some(ref eb) = expiry_badge {
                 if eb.starts_with("[expired]") {
