@@ -18,13 +18,20 @@ It also handles the `claude setup-token` (long-lived token) path, where `CLAUDE_
 
 ## Install
 
-**Requires:** Rust toolchain (`curl https://sh.rustup.rs | sh`)
+**macOS (Homebrew):**
+
+```bash
+brew tap vyshnavsdeepak/ccswitch https://github.com/vyshnavsdeepak/ccswitch
+brew install ccswitch
+```
+
+**Cargo:**
 
 ```bash
 cargo install --git https://github.com/vyshnavsdeepak/ccswitch
 ```
 
-Or from source:
+**From source:**
 
 ```bash
 git clone https://github.com/vyshnavsdeepak/ccswitch
@@ -60,34 +67,29 @@ ccswitch switch       # rotate to the next account
 ccswitch add
 # → reads the token from $CLAUDE_CODE_OAUTH_TOKEN automatically
 # → prompts for an email/label (e.g. work@company.com)
-# → on first add, prints a one-time setup instruction:
+# → writes the token directly to the system keychain
 
-#   Add to ~/.zshrc:  source ~/.ccswitchrc
-#   Then open a new terminal.
-
-# 2. Add more token accounts — run ccswitch add again:
+# 2. Add more token accounts:
 ccswitch add
-# → if $CLAUDE_CODE_OAUTH_TOKEN is already managed, it prompts you to paste a different token
+# → if $CLAUDE_CODE_OAUTH_TOKEN is already managed, prompts for a different token
 
 # 3. Switch:
 ccswitch switch 2
-# → updates the active token; the shell function in ~/.ccswitchrc refreshes
-#   CLAUDE_CODE_OAUTH_TOKEN in the current shell — no new terminal needed
+# → writes the new token to the keychain; restart Claude Code to apply
 ```
-
-After the one-time `source ~/.ccswitchrc` in your shell profile, ccswitch manages `CLAUDE_CODE_OAUTH_TOKEN` on every switch automatically. `~/.zshrc` is never touched again.
 
 ---
 
 ## Commands
 
 ```
-ccswitch                    open interactive TUI (recommended)
-ccswitch add                add current / $CLAUDE_CODE_OAUTH_TOKEN account
-ccswitch list               list all managed accounts
-ccswitch status             show which account is active
-ccswitch switch [n|email]   switch to account n or by email; rotates if omitted
-ccswitch remove [n|email]   remove account n or by email
+ccswitch                      open interactive TUI (recommended)
+ccswitch add                  add current / $CLAUDE_CODE_OAUTH_TOKEN account
+ccswitch list                 list all managed accounts (shows session expiry)
+ccswitch status               show which account is active
+ccswitch switch [n|email]     switch to account n or by email; rotates if omitted
+ccswitch refresh [n|email]    refresh OAuth session token (active account if omitted)
+ccswitch remove [n|email]     remove account n or by email
 ```
 
 `switch` and `remove` accept either the account number or the full email address:
@@ -127,37 +129,28 @@ Run `ccswitch` with no arguments for the full interactive interface.
 | `d / Delete` | remove selected account |
 | `q / Esc` | quit |
 
-Token accounts show a dim `[token]` badge. After switching to a token account, the Done banner reminds you to open a new shell (so `CLAUDE_CODE_OAUTH_TOKEN` updates).
+Token accounts show a dim `[token]` badge. After switching, restart Claude Code to apply — no new shell needed.
 
 ---
 
 ## After switching
 
-| Account type | What to do |
-|---|---|
-| OAuth | Restart Claude Code |
-| Token | Restart Claude Code (current shell updates automatically if you sourced `~/.ccswitchrc`) |
+Restart Claude Code — that's it. Credentials are written directly to the system keychain, so no new shell or environment changes are needed.
+
+> **Note:** if `CLAUDE_CODE_OAUTH_TOKEN` is set in your current shell (from a previous setup), ccswitch will warn you. Run `unset CLAUDE_CODE_OAUTH_TOKEN` or add `source ~/.ccswitchrc` to your shell profile to clear it permanently.
 
 ---
 
 ## How `~/.ccswitchrc` works
 
-On first token account add, ccswitch writes a small file:
+ccswitch writes a small file that clears `CLAUDE_CODE_OAUTH_TOKEN` so Claude Code reads credentials from the keychain instead:
 
 ```bash
 # Managed by ccswitch — do not edit manually
-export CLAUDE_CODE_OAUTH_TOKEN=$(security find-generic-password -s "ccswitch-active-token" -w 2>/dev/null)
-
-# Shell wrapper: refreshes CLAUDE_CODE_OAUTH_TOKEN in the current shell after every switch
-ccswitch() {
-  command ccswitch "$@"
-  local _tok
-  _tok=$(security find-generic-password -s "ccswitch-active-token" -w 2>/dev/null)
-  [ -n "$_tok" ] && export CLAUDE_CODE_OAUTH_TOKEN="$_tok"
-}
+unset CLAUDE_CODE_OAUTH_TOKEN
 ```
 
-The `export` line sets the token when a new shell starts. The `ccswitch()` wrapper re-reads it after every switch so the **current shell** stays in sync — no new terminal needed. Source the file once in `~/.zshrc` and you're done. Existing users get the wrapper silently on the next `ccswitch add` or `ccswitch switch`.
+Add `source ~/.ccswitchrc` to your `~/.zshrc` (or `~/.bashrc`) once. Any shell you open will have the env var cleared, so Claude Code always uses the keychain — which ccswitch keeps up to date.
 
 ---
 
