@@ -26,6 +26,8 @@ enum Mode {
     ConfirmSwitch { num: u32, email: String },
     ConfirmRemove { num: u32, email: String },
     ConfirmAdd { email: String },
+    /// Shown when a refresh attempt fails with invalid_grant (expired refresh token).
+    ExpiredAccount { num: u32, email: String },
     /// Switch (or other action) completed.
     Done,
 }
@@ -153,6 +155,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
                 Mode::ConfirmSwitch { .. }
                 | Mode::ConfirmRemove { .. }
                 | Mode::ConfirmAdd { .. } => handle_confirm(&mut app, key.code)?,
+                Mode::ExpiredAccount { .. } => handle_expired(&mut app, key.code)?,
                 Mode::Done => {
                     app.quit = true;
                 }
@@ -239,6 +242,41 @@ fn handle_normal(app: &mut App, key: KeyCode) -> Result<()> {
                 // No OAuth account — suspend TUI and run the interactive add flow
                 // (covers token accounts and fresh installs where the user pastes a token).
                 app.pending_token_add = true;
+            }
+        }
+        KeyCode::Char('r') => {
+            if let Some(num) = app.selected_num() {
+                if let Some(entry) = app.seq.accounts.get(&num.to_string()) {
+                    let email = entry.email.clone();
+                    if entry.auth_kind == AuthKind::Oauth {
+                        match accounts::core_refresh(num) {
+                            Ok(msg) => {
+                                app.reload()?;
+                                app.flash = Some(Flash {
+                                    message: msg,
+                                    is_error: false,
+                                });
+                            }
+                            Err(e) if accounts::is_invalid_grant_error(&e) => {
+                                app.mode = Mode::ExpiredAccount { num, email };
+                            }
+                            Err(e) => {
+                                app.flash = Some(Flash {
+                                    message: format!(
+                                        "Refresh failed: {}",
+                                        e.to_string().lines().next().unwrap_or("error")
+                                    ),
+                                    is_error: true,
+                                });
+                            }
+                        }
+                    } else {
+                        app.flash = Some(Flash {
+                            message: "Token accounts don't use refresh tokens".to_string(),
+                            is_error: false,
+                        });
+                    }
+                }
             }
         }
         KeyCode::Char('d') | KeyCode::Delete => {
@@ -330,6 +368,28 @@ fn handle_confirm(app: &mut App, key: KeyCode) -> Result<()> {
     Ok(())
 }
 
+fn handle_expired(app: &mut App, key: KeyCode) -> Result<()> {
+    match key {
+        KeyCode::Char('d') | KeyCode::Delete => {
+            // Reuse the existing ConfirmRemove flow for the actual deletion.
+            let (num, email) = match &app.mode {
+                Mode::ExpiredAccount { num, email } => (*num, email.clone()),
+                _ => return Ok(()),
+            };
+            app.mode = Mode::ConfirmRemove { num, email };
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = Mode::Normal;
+            app.flash = Some(Flash {
+                message: "Re-auth: ccswitch switch <n>  →  claude  →  ccswitch add".to_string(),
+                is_error: false,
+            });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 // ── UI rendering ──────────────────────────────────────────────────────────────
 
 fn ui(f: &mut ratatui::Frame, app: &mut App) {
@@ -379,6 +439,9 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
                 email,
                 Color::Yellow,
             );
+        }
+        Mode::ExpiredAccount { num, email } => {
+            render_expired_dialog(f, area, *num, email);
         }
         _ => {}
     }
@@ -567,7 +630,7 @@ fn render_help(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 ])
             } else {
                 Line::from(vec![Span::styled(
-                    "  ↑↓ nav  ·  ↵ switch  ·  a add  ·  d remove  ·  q quit",
+                    "  ↑↓ nav  ·  ↵ switch  ·  a add  ·  d remove  ·  r refresh  ·  q quit",
                     Style::default().fg(Color::DarkGray),
                 )])
             };
@@ -632,6 +695,64 @@ fn render_confirm_dialog(
             ),
             Span::styled(
                 "      [n / Esc] cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    ];
+
+    let para = Paragraph::new(text).alignment(Alignment::Left);
+    f.render_widget(para, inner);
+}
+
+fn render_expired_dialog(f: &mut ratatui::Frame, area: Rect, num: u32, email: &str) {
+    let dialog_width = 66u16;
+    let dialog_height = 10u16;
+
+    let x = area.x + area.width.saturating_sub(dialog_width) / 2;
+    let y = area.y + area.height.saturating_sub(dialog_height) / 2;
+
+    let dialog_area = Rect {
+        x,
+        y,
+        width: dialog_width.min(area.width),
+        height: dialog_height.min(area.height),
+    };
+
+    f.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .title(" Expired Refresh Token ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Red));
+
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("   Account {}  ({})", num, email),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![Span::styled(
+            "   Refresh token is invalid — re-authentication required.",
+            Style::default().fg(Color::White),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "   Re-add:  ccswitch switch N  →  claude  →  ccswitch add",
+            Style::default().fg(Color::Cyan),
+        )]),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "   [d] remove account",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "      [Esc] cancel",
                 Style::default().fg(Color::DarkGray),
             ),
         ]),

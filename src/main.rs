@@ -101,6 +101,14 @@ enum Commands {
         all: bool,
     },
 
+    /// Edit the label (email) of a managed account
+    Edit {
+        /// Account number or email to edit
+        account: String,
+        /// New email / label to assign
+        new_label: String,
+    },
+
     /// Set a short alias for an account
     Alias {
         /// Account number or email to alias
@@ -151,6 +159,7 @@ fn run() -> Result<()> {
         Some(Commands::Refresh { account, all }) => {
             accounts::refresh(account.as_deref(), all)
         }
+        Some(Commands::Edit { account, new_label }) => accounts::edit_account(&account, &new_label),
         Some(Commands::Alias { account, name }) => accounts::set_alias(&account, &name),
         Some(Commands::Completions { shell }) => {
             clap_complete::generate(shell, &mut Cli::command(), "ccswitch", &mut std::io::stdout());

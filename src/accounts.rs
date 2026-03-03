@@ -36,6 +36,13 @@ pub(crate) fn core_add() -> Result<String> {
     credentials::write_backup(account_num, &email, &live_creds)?;
     write_config_backup(account_num, &email, &live_config_str)?;
 
+    // Record the credential format fingerprint so future switches/refreshes
+    // can detect if Claude Code has changed its credential schema.
+    let fp = credentials::credential_field_fingerprint(&live_creds);
+    if !fp.is_empty() {
+        seq.format_fingerprint = Some(fp);
+    }
+
     seq.accounts.insert(
         account_num.to_string(),
         AccountEntry {
@@ -86,6 +93,7 @@ pub(crate) fn core_switch(target_num: u32) -> Result<String> {
     // Token accounts: skip — the token is static and was already stored during `add`
     if current_auth_kind == AuthKind::Oauth {
         let live_creds = credentials::read_live().context("Cannot read current credentials")?;
+        warn_if_format_changed(&seq, &live_creds);
         let live_config = config::load().context("Cannot read current Claude config")?;
         let live_config_str = serde_json::to_string_pretty(&live_config)?;
 
@@ -359,6 +367,68 @@ fn token_default_label() -> String {
     format!("token-{:08X}", ts)
 }
 
+// ── Re-auth helpers ───────────────────────────────────────────────────────────
+
+/// Returns true if the error is caused by an expired/revoked refresh token
+/// (OAuth `invalid_grant`).
+pub(crate) fn is_invalid_grant_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("invalid_grant") || msg.contains("Refresh token expired")
+}
+
+/// Interactive CLI prompt shown when a refresh token is permanently invalid.
+/// Prints re-auth instructions, then offers to remove the account.
+pub(crate) fn interactive_reauth_prompt(num: u32, email: &str) -> Result<()> {
+    println!();
+    println!(
+        "  {} Refresh token for Account {} ({}) has expired (invalid_grant).",
+        "!".red().bold(),
+        num,
+        email.yellow()
+    );
+    println!(
+        "  {} The token cannot be renewed automatically — \
+         you need to log in again.",
+        " ".normal()
+    );
+    println!();
+    println!("  To re-authenticate this account:");
+    println!(
+        "    {}  {}  {}",
+        "1.".cyan().bold(),
+        "Switch to it:   ",
+        format!("ccswitch switch {}", num).cyan().bold()
+    );
+    println!(
+        "    {}  {}",
+        "2.".cyan().bold(),
+        "Open Claude Code and log in (run: claude)"
+    );
+    println!(
+        "    {}  {}  {}",
+        "3.".cyan().bold(),
+        "Save the session:",
+        "ccswitch add".cyan().bold()
+    );
+    println!();
+
+    print!("  Remove Account {} ({}) now? [y/N] ", num, email);
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    if matches!(input.trim(), "y" | "Y") {
+        let msg = core_remove(num, email)?;
+        println!("\n  {} {}", "✓".green().bold(), msg);
+    } else {
+        println!("  {} Kept — re-authenticate when ready.", "·".dimmed());
+    }
+    println!();
+
+    Ok(())
+}
+
 // ── Refresh OAuth token ───────────────────────────────────────────────────────
 
 pub(crate) fn core_refresh(target_num: u32) -> Result<String> {
@@ -385,6 +455,7 @@ pub(crate) fn core_refresh(target_num: u32) -> Result<String> {
         credentials::read_backup(target_num, &entry.email)
             .with_context(|| format!("Cannot read backup credentials for Account {target_num}"))?
     };
+    warn_if_format_changed(&seq, &creds);
 
     let new_creds = credentials::refresh_oauth_creds(&creds).map_err(|e| {
         // Distinguish between a bad refresh token (needs full re-login) and network/other errors
@@ -438,8 +509,20 @@ pub fn refresh(identifier: Option<&str>, all: bool) -> Result<()> {
     };
 
     println!();
-    let msg = core_refresh(target_num)?;
-    println!("  {} {}\n", "✓".green().bold(), msg);
+    match core_refresh(target_num) {
+        Ok(msg) => {
+            println!("  {} {}\n", "✓".green().bold(), msg);
+        }
+        Err(e) if is_invalid_grant_error(&e) => {
+            let email = seq
+                .accounts
+                .get(&target_num.to_string())
+                .map(|entry| entry.email.clone())
+                .unwrap_or_default();
+            interactive_reauth_prompt(target_num, &email)?;
+        }
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
@@ -957,6 +1040,81 @@ fn do_switch(target_num: u32) -> Result<()> {
     Ok(())
 }
 
+// ── Edit account label ────────────────────────────────────────────────────────
+
+pub(crate) fn core_edit_account(num: u32, old_email: &str, new_label: &str) -> Result<String> {
+    // Read existing credentials backup before touching anything
+    let creds = credentials::read_backup(num, old_email)
+        .with_context(|| format!("Cannot read credentials backup for Account {num}"))?;
+
+    // Write new backup under new label, then delete old one
+    credentials::write_backup(num, new_label, &creds)?;
+    credentials::delete_backup(num, old_email)?;
+
+    // Migrate config backup (best-effort — missing backup is not fatal)
+    if let Ok(config_str) = read_config_backup(num, old_email) {
+        write_config_backup(num, new_label, &config_str)?;
+        let _ = std::fs::remove_file(config_backup_path(num, old_email));
+    }
+
+    // Update sequence.json
+    let mut seq = sequence::load()?;
+    if let Some(entry) = seq.accounts.get_mut(&num.to_string()) {
+        entry.email = new_label.to_string();
+    }
+    seq.last_updated = now_utc();
+    sequence::save(&seq)?;
+
+    Ok(format!(
+        "Renamed Account {num}: '{}' → '{}'",
+        old_email, new_label
+    ))
+}
+
+pub fn edit_account(identifier: &str, new_label: &str) -> Result<()> {
+    let seq = sequence::load()?;
+
+    if seq.accounts.is_empty() {
+        bail!("No accounts managed yet. Run `ccswitch add` first.");
+    }
+
+    let num = seq
+        .resolve(identifier)
+        .with_context(|| format!("No account found matching '{identifier}'"))?;
+
+    let entry = seq
+        .accounts
+        .get(&num.to_string())
+        .cloned()
+        .with_context(|| format!("Account {num} does not exist"))?;
+
+    let old_email = entry.email.clone();
+
+    if old_email == new_label {
+        println!(
+            "\n  {} Account {} already has label '{}'.\n",
+            "·".cyan(),
+            num,
+            new_label
+        );
+        return Ok(());
+    }
+
+    if let Some(existing_num) = seq.find_by_email(new_label) {
+        if existing_num != num {
+            bail!(
+                "Label '{}' is already used by Account {}",
+                new_label,
+                existing_num
+            );
+        }
+    }
+
+    let msg = core_edit_account(num, &old_email, new_label)?;
+    println!("\n  {} {}\n", "✓".green().bold(), msg);
+    Ok(())
+}
+
 // ── Credential helpers ────────────────────────────────────────────────────────
 
 /// Check whether a token value is already stored in any managed account.
@@ -1043,6 +1201,23 @@ pub(crate) fn read_config_backup(num: u32, email: &str) -> Result<String> {
 }
 
 // ── Session expiry helper ─────────────────────────────────────────────────────
+
+/// Compare the fingerprint of `creds` against the stored one in `seq`.
+/// Prints a warning to stderr when they differ.
+fn warn_if_format_changed(seq: &SequenceFile, creds: &str) {
+    let Some(stored_fp) = seq.format_fingerprint.as_deref() else {
+        return;
+    };
+    let live_fp = credentials::credential_field_fingerprint(creds);
+    if !live_fp.is_empty() && live_fp != stored_fp {
+        eprintln!(
+            "\n  {} Claude Code may have changed its credential format. \
+             ccswitch may not work correctly. \
+             Please check https://github.com/vyshnavsdeepak/ccswitch/issues for updates.",
+            "Warning:".yellow().bold()
+        );
+    }
+}
 
 /// Return a short badge string describing session expiry for display in lists.
 /// Empty string means the session is healthy and no badge is needed.
@@ -1388,6 +1563,32 @@ mod tests {
         test_utils::TestEnv,
     };
     use std::fs;
+
+    // ── is_invalid_grant_error ────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_invalid_grant_error_http_response() {
+        let e = anyhow::anyhow!("Token refresh failed (HTTP 400): invalid_grant: Refresh token not found");
+        assert!(is_invalid_grant_error(&e));
+    }
+
+    #[test]
+    fn test_is_invalid_grant_error_transformed_message() {
+        let e = anyhow::anyhow!("Refresh token expired for Account 2 (user@test.com).");
+        assert!(is_invalid_grant_error(&e));
+    }
+
+    #[test]
+    fn test_is_invalid_grant_error_network_error() {
+        let e = anyhow::anyhow!("Token refresh request failed: connection refused");
+        assert!(!is_invalid_grant_error(&e));
+    }
+
+    #[test]
+    fn test_is_invalid_grant_error_http_500() {
+        let e = anyhow::anyhow!("Token refresh failed (HTTP 500): internal server error");
+        assert!(!is_invalid_grant_error(&e));
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -2055,5 +2256,142 @@ mod tests {
         // doctor() should always return Ok regardless of issues found
         let result = doctor();
         assert!(result.is_ok(), "doctor() should return Ok even with no accounts");
+    }
+
+    // ── Tests: core_edit_account ──────────────────────────────────────────────
+
+    fn setup_single_oauth(env: &TestEnv, num: u32, email: &str) {
+        let creds = make_oauth_creds(email);
+        let cfg = make_oauth_config(email, &format!("uuid-{num}"));
+
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert(num.to_string(), entry(email, AuthKind::Oauth));
+        seq.sequence = vec![num];
+        seq.active_account_number = Some(num);
+        seq.last_updated = sequence::now_utc();
+        sequence::save(&seq).unwrap();
+
+        write_live_file(env, &creds);
+        write_config_file(env, &cfg);
+
+        credentials::write_backup(num, email, &creds).unwrap();
+        fs::write(
+            config_backup_path(num, email),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_core_edit_renames_label() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 1, "old@test.com");
+
+        let msg = core_edit_account(1, "old@test.com", "new@test.com").unwrap();
+        assert!(msg.contains("old@test.com"), "unexpected: {msg}");
+        assert!(msg.contains("new@test.com"), "unexpected: {msg}");
+
+        // sequence.json updated
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.accounts["1"].email, "new@test.com");
+
+        // New credentials backup exists, old one gone
+        assert!(
+            credentials::read_backup(1, "new@test.com").is_ok(),
+            "new backup should exist"
+        );
+        assert!(
+            credentials::read_backup(1, "old@test.com").is_err(),
+            "old backup should be gone"
+        );
+
+        // New config backup exists
+        assert!(
+            read_config_backup(1, "new@test.com").is_ok(),
+            "new config backup should exist"
+        );
+        assert!(
+            !config_backup_path(1, "old@test.com").exists(),
+            "old config backup should be gone"
+        );
+    }
+
+    #[test]
+    fn test_core_edit_active_account_stays_active() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 1, "active@test.com");
+
+        core_edit_account(1, "active@test.com", "renamed@test.com").unwrap();
+
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.active_account_number, Some(1));
+        assert_eq!(seq.accounts["1"].email, "renamed@test.com");
+    }
+
+    #[test]
+    fn test_core_edit_missing_backup_returns_error() {
+        let _env = TestEnv::new();
+
+        // Sequence has an account but no credentials backup on disk
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), entry("ghost@test.com", AuthKind::Oauth));
+        seq.sequence = vec![1];
+        seq.active_account_number = Some(1);
+        seq.last_updated = sequence::now_utc();
+        sequence::save(&seq).unwrap();
+
+        let err = core_edit_account(1, "ghost@test.com", "new@test.com").unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot read credentials backup"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_edit_account_conflict_with_existing() {
+        let env = TestEnv::new();
+        setup_two_oauth(&env);
+
+        // Try to rename account 1 to the email already used by account 2
+        let err = edit_account("1", "acct2@test.com").unwrap_err();
+        assert!(
+            err.to_string().contains("already used by Account"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_edit_account_no_op_same_label() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 1, "same@test.com");
+
+        // Should succeed without error and leave the sequence unchanged
+        edit_account("1", "same@test.com").unwrap();
+
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.accounts["1"].email, "same@test.com");
+    }
+
+    #[test]
+    fn test_edit_account_resolve_by_number() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 3, "user@test.com");
+
+        let result = edit_account("3", "updated@test.com");
+        assert!(result.is_ok(), "unexpected: {:?}", result);
+
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.accounts["3"].email, "updated@test.com");
+    }
+
+    #[test]
+    fn test_edit_account_resolve_by_email() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 2, "byemail@test.com");
+
+        edit_account("byemail@test.com", "changed@test.com").unwrap();
+
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.accounts["2"].email, "changed@test.com");
     }
 }
