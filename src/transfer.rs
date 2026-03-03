@@ -115,16 +115,111 @@ pub fn export(account: Option<&str>, all: bool) -> Result<()> {
     let json = serde_json::to_string(&payload).context("Failed to serialize export payload")?;
     let blob = STANDARD.encode(json.as_bytes());
 
-    let sep = "──────────────────────────────────────────────────────────────";
     println!();
-    println!(
-        "  {}  Keep this blob secret — it contains your credentials.\n",
+    if copy_to_clipboard(&blob) {
+        println!(
+            "  {}  Copied to clipboard — run {} on the remote and paste.\n",
+            "✓".green().bold(),
+            "ccswitch import".cyan().bold()
+        );
+    } else {
+        offer_write_to_file(&blob)?;
+    }
+
+    Ok(())
+}
+
+// ── clipboard / file helpers ──────────────────────────────────────────────────
+
+/// Try to copy `blob` to the system clipboard. Returns true on success.
+fn copy_to_clipboard(blob: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Candidates: (binary, args)
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+
+    #[cfg(not(target_os = "macos"))]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    for (bin, args) in candidates {
+        let Ok(mut child) = Command::new(bin)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if stdin.write_all(blob.as_bytes()).is_err() {
+                continue;
+            }
+        }
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// When no clipboard tool is available, prompt the user for a file path and
+/// write the blob there (mode 0600). Prints guidance on cleanup.
+fn offer_write_to_file(blob: &str) -> Result<()> {
+    use std::io::Write;
+
+    #[cfg(not(target_os = "macos"))]
+    eprintln!(
+        "  {}  No clipboard tool found (tried wl-copy, xclip, xsel).",
         "⚠".yellow().bold()
     );
-    println!("  {}", sep.dimmed());
-    println!("  {blob}");
-    println!("  {}", sep.dimmed());
-    println!("\n  Run `ccswitch import` on the remote and paste when prompted.\n");
+
+    print!("  Write blob to file instead? [path or Enter to cancel]: ");
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let raw = input.trim();
+
+    if raw.is_empty() {
+        anyhow::bail!("Export cancelled.");
+    }
+
+    // Expand a leading ~ manually (std::path doesn't do it).
+    let path = if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .context("Cannot find home directory")?
+            .join(rest)
+    } else {
+        std::path::PathBuf::from(raw)
+    };
+
+    std::fs::write(&path, blob)
+        .with_context(|| format!("Cannot write to {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    println!(
+        "  {}  Written to {} — keep it secret and delete after use.\n",
+        "✓".green().bold(),
+        path.display().to_string().cyan()
+    );
+    println!(
+        "  {}  Run {} on the remote, then: {}\n",
+        "·".dimmed(),
+        "ccswitch import".cyan().bold(),
+        format!("rm {}", path.display()).dimmed()
+    );
 
     Ok(())
 }
