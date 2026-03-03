@@ -3,6 +3,7 @@ mod config;
 mod credentials;
 mod platform;
 mod sequence;
+mod transfer;
 mod tui;
 mod update;
 
@@ -129,6 +130,17 @@ enum Commands {
 
     /// Update ccswitch to the latest release
     Update,
+
+    /// Export one or more managed accounts as a portable blob (paste into remote VM)
+    Export {
+        #[arg(long, value_name = "ID")]
+        account: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Import accounts from an export blob (reads interactively — no shell history)
+    Import,
 }
 
 fn main() {
@@ -171,5 +183,7 @@ fn run() -> Result<()> {
         }
         Some(Commands::Doctor) => accounts::doctor(),
         Some(Commands::Update) => update::update(),
+        Some(Commands::Export { account, all }) => transfer::export(account.as_deref(), all),
+        Some(Commands::Import) => transfer::import(),
     }
 }
