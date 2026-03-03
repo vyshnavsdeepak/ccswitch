@@ -88,6 +88,14 @@ enum Commands {
         /// Account number or email to refresh (optional; uses active account if omitted)
         account: Option<String>,
     },
+
+    /// Set a short alias for an account
+    Alias {
+        /// Account number or email to alias
+        account: String,
+        /// Short name to use as the alias (e.g. "work", "personal")
+        name: String,
+    },
 }
 
 fn main() {
@@ -122,5 +130,6 @@ fn run() -> Result<()> {
         Some(Commands::Refresh { account }) => {
             accounts::refresh(account.as_deref())
         }
+        Some(Commands::Alias { account, name }) => accounts::set_alias(&account, &name),
     }
 }
