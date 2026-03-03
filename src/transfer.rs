@@ -128,7 +128,7 @@ pub fn export(account: Option<&str>, all: bool) -> Result<()> {
     };
 
     if use_file {
-        offer_write_to_file(&blob)?;
+        write_blob_to_file(&blob)?;
     } else if copy_to_clipboard(&blob) {
         println!(
             "  {}  Copied to clipboard — run {} on the remote and paste.\n",
@@ -136,7 +136,13 @@ pub fn export(account: Option<&str>, all: bool) -> Result<()> {
             "ccswitch import".cyan().bold()
         );
     } else {
-        offer_write_to_file(&blob)?;
+        // Clipboard not available — warn and fall back to file.
+        #[cfg(not(target_os = "macos"))]
+        eprintln!(
+            "  {}  No clipboard tool found (tried wl-copy, xclip, xsel).",
+            "⚠".yellow().bold()
+        );
+        write_blob_to_file(&blob)?;
     }
 
     Ok(())
@@ -250,18 +256,11 @@ fn copy_to_clipboard(blob: &str) -> bool {
     false
 }
 
-/// When no clipboard tool is available, prompt the user for a file path and
-/// write the blob there (mode 0600). Prints guidance on cleanup.
-fn offer_write_to_file(blob: &str) -> Result<()> {
+/// Prompt for a file path and write the blob there (mode 0600).
+fn write_blob_to_file(blob: &str) -> Result<()> {
     use std::io::Write;
 
-    #[cfg(not(target_os = "macos"))]
-    eprintln!(
-        "  {}  No clipboard tool found (tried wl-copy, xclip, xsel).",
-        "⚠".yellow().bold()
-    );
-
-    print!("  Write blob to file instead? [path or Enter to cancel]: ");
+    print!("  File path [Enter to cancel]: ");
     std::io::stdout().flush()?;
 
     let mut input = String::new();
