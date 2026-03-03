@@ -37,7 +37,7 @@ pub(crate) mod test_utils {
 }
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use colored::Colorize;
 
 #[derive(Parser)]
@@ -96,6 +96,12 @@ enum Commands {
         /// Short name to use as the alias (e.g. "work", "personal")
         name: String,
     },
+
+    /// Generate shell completion script
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 fn main() {
@@ -131,5 +137,9 @@ fn run() -> Result<()> {
             accounts::refresh(account.as_deref())
         }
         Some(Commands::Alias { account, name }) => accounts::set_alias(&account, &name),
+        Some(Commands::Completions { shell }) => {
+            clap_complete::generate(shell, &mut Cli::command(), "ccswitch", &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
