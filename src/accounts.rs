@@ -409,11 +409,19 @@ pub(crate) fn core_refresh(target_num: u32) -> Result<String> {
     Ok(format!("Refreshed token for Account {} ({})", target_num, entry.email))
 }
 
-pub fn refresh(identifier: Option<&str>) -> Result<()> {
+pub fn refresh(identifier: Option<&str>, all: bool) -> Result<()> {
+    if all && identifier.is_some() {
+        bail!("--all cannot be combined with a specific account identifier.");
+    }
+
     let seq = sequence::load()?;
 
     if seq.accounts.is_empty() {
         bail!("No accounts managed yet. Run `ccswitch add` first.");
+    }
+
+    if all {
+        return refresh_all(&seq);
     }
 
     let target_num = if let Some(id) = identifier {
@@ -432,6 +440,95 @@ pub fn refresh(identifier: Option<&str>) -> Result<()> {
     println!();
     let msg = core_refresh(target_num)?;
     println!("  {} {}\n", "✓".green().bold(), msg);
+    Ok(())
+}
+
+fn refresh_all(seq: &SequenceFile) -> Result<()> {
+    const THRESHOLD_SECS: i64 = 24 * 3600;
+
+    let mut n_refreshed = 0u32;
+    let mut n_skipped = 0u32;
+    let mut failures: Vec<String> = vec![];
+
+    println!();
+
+    for &num in &seq.sequence {
+        let Some(entry) = seq.accounts.get(&num.to_string()) else {
+            continue;
+        };
+
+        if entry.auth_kind == AuthKind::Token {
+            println!(
+                "  {}  Account {} ({}) — skipped (token account)",
+                "·".dimmed(),
+                num,
+                entry.email.dimmed()
+            );
+            n_skipped += 1;
+            continue;
+        }
+
+        let is_active = seq.active_account_number == Some(num);
+        let creds_result = if is_active {
+            credentials::read_live()
+        } else {
+            credentials::read_backup(num, &entry.email)
+        };
+
+        let needs_refresh = match creds_result {
+            Err(_) => true,
+            Ok(ref c) => credentials::oauth_secs_remaining(c)
+                .map_or(false, |secs| secs <= THRESHOLD_SECS),
+        };
+
+        if !needs_refresh {
+            println!(
+                "  {}  Account {} ({}) — healthy, skipped",
+                "·".dimmed(),
+                num,
+                entry.email.dimmed()
+            );
+            n_skipped += 1;
+            continue;
+        }
+
+        match core_refresh(num) {
+            Ok(msg) => {
+                println!("  {}  {}", "✓".green().bold(), msg);
+                n_refreshed += 1;
+            }
+            Err(e) => {
+                let first_line = e.to_string();
+                let first_line = first_line.lines().next().unwrap_or("error");
+                println!(
+                    "  {}  Account {} ({}) — {}",
+                    "✗".red().bold(),
+                    num,
+                    entry.email,
+                    first_line
+                );
+                failures.push(format!("Account {} ({}): {}", num, entry.email, e));
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "  Summary — refreshed: {}  skipped: {}  failed: {}",
+        n_refreshed.to_string().bold(),
+        n_skipped.to_string().dimmed(),
+        if failures.is_empty() {
+            "0".normal()
+        } else {
+            failures.len().to_string().red().bold()
+        }
+    );
+    println!();
+
+    if !failures.is_empty() {
+        bail!("{} account(s) failed to refresh", failures.len());
+    }
+
     Ok(())
 }
 
@@ -1327,5 +1424,159 @@ mod tests {
         do_switch(2).unwrap();
 
         assert_eq!(sequence::load().unwrap().active_account_number, Some(2));
+    }
+
+    // ── Tests: refresh --all ──────────────────────────────────────────────────
+
+    fn make_oauth_creds_with_expiry(label: &str, expires_at_ms: i64) -> String {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": format!("sk-ant-oat01-{}", label),
+                "refreshToken": format!("sk-ant-ort01-{}", label),
+                "expiresAt": expires_at_ms
+            }
+        })
+        .to_string()
+    }
+
+    /// Build a SequenceFile with one or more accounts (does not persist to disk).
+    fn seq_with_accounts(entries: &[(u32, &str, AuthKind)]) -> SequenceFile {
+        let mut seq = SequenceFile::default();
+        for &(num, email, ref kind) in entries {
+            seq.accounts.insert(
+                num.to_string(),
+                AccountEntry {
+                    email: email.to_string(),
+                    uuid: format!("uuid-{num}"),
+                    added: sequence::now_utc(),
+                    auth_kind: kind.clone(),
+                },
+            );
+            seq.sequence.push(num);
+        }
+        seq.active_account_number = entries.first().map(|&(num, _, _)| num);
+        seq.last_updated = sequence::now_utc();
+        seq
+    }
+
+    #[test]
+    fn test_refresh_all_skips_token_accounts() {
+        let _env = TestEnv::new();
+
+        let seq = seq_with_accounts(&[(1, "token@test.com", AuthKind::Token)]);
+        sequence::save(&seq).unwrap();
+
+        // No credentials written — token accounts should be skipped without error.
+        let result = refresh_all(&seq);
+        assert!(result.is_ok(), "expected Ok for all-token seq, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_refresh_all_skips_healthy_oauth() {
+        let _env = TestEnv::new();
+
+        let expires_ms = chrono::Utc::now().timestamp_millis() + 30 * 86400 * 1000_i64; // 30 days
+        let creds = make_oauth_creds_with_expiry("healthy", expires_ms);
+
+        let mut seq = seq_with_accounts(&[(1, "healthy@test.com", AuthKind::Oauth)]);
+        seq.active_account_number = Some(1);
+        sequence::save(&seq).unwrap();
+
+        // Write as live credentials (account 1 is active)
+        fs::write(
+            _env.dir.path().join(".credentials.json"),
+            &creds,
+        )
+        .unwrap();
+
+        let result = refresh_all(&seq);
+        assert!(result.is_ok(), "healthy account should be skipped, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_refresh_all_attempts_expired_oauth() {
+        let _env = TestEnv::new();
+
+        let expires_ms = chrono::Utc::now().timestamp_millis() - 3600 * 1000_i64; // 1h ago
+        let creds = make_oauth_creds_with_expiry("expired", expires_ms);
+
+        let mut seq = seq_with_accounts(&[(1, "expired@test.com", AuthKind::Oauth)]);
+        seq.active_account_number = Some(1);
+        sequence::save(&seq).unwrap();
+
+        fs::write(
+            _env.dir.path().join(".credentials.json"),
+            &creds,
+        )
+        .unwrap();
+
+        // core_refresh will attempt a network call that fails in the test env.
+        // We verify that refresh_all returns an error (account was attempted, not skipped).
+        let result = refresh_all(&seq);
+        assert!(result.is_err(), "expired account should be attempted and fail in test env");
+    }
+
+    #[test]
+    fn test_refresh_all_attempts_expiring_soon_oauth() {
+        let _env = TestEnv::new();
+
+        let expires_ms = chrono::Utc::now().timestamp_millis() + 12 * 3600 * 1000_i64; // 12h
+        let creds = make_oauth_creds_with_expiry("expiring", expires_ms);
+
+        let mut seq = seq_with_accounts(&[(1, "expiring@test.com", AuthKind::Oauth)]);
+        seq.active_account_number = Some(1);
+        sequence::save(&seq).unwrap();
+
+        fs::write(
+            _env.dir.path().join(".credentials.json"),
+            &creds,
+        )
+        .unwrap();
+
+        // Token expires within 24h → should be attempted.
+        let result = refresh_all(&seq);
+        assert!(result.is_err(), "expiring-soon account should be attempted and fail in test env");
+    }
+
+    #[test]
+    fn test_refresh_all_mixed_accounts() {
+        let _env = TestEnv::new();
+
+        let healthy_ms = chrono::Utc::now().timestamp_millis() + 30 * 86400 * 1000_i64;
+        let expired_ms = chrono::Utc::now().timestamp_millis() - 3600 * 1000_i64;
+
+        let creds_active = make_oauth_creds_with_expiry("active-healthy", healthy_ms);
+        let creds_inactive = make_oauth_creds_with_expiry("inactive-expired", expired_ms);
+
+        let mut seq = seq_with_accounts(&[
+            (1, "active@test.com", AuthKind::Oauth),
+            (2, "expired@test.com", AuthKind::Oauth),
+            (3, "token@test.com", AuthKind::Token),
+        ]);
+        seq.active_account_number = Some(1);
+        sequence::save(&seq).unwrap();
+
+        // Account 1 active (healthy)
+        fs::write(_env.dir.path().join(".credentials.json"), &creds_active).unwrap();
+        // Account 2 backup (expired)
+        credentials::write_backup(2, "expired@test.com", &creds_inactive).unwrap();
+
+        // Account 1 is healthy → skipped. Account 3 is token → skipped.
+        // Account 2 is expired → attempted → fails in test env.
+        let result = refresh_all(&seq);
+        assert!(result.is_err(), "one expired account should cause overall failure");
+    }
+
+    #[test]
+    fn test_refresh_flag_all_with_identifier_is_error() {
+        let _env = TestEnv::new();
+
+        // Set up a minimal valid sequence so we get past the empty-check
+        let seq = seq_with_accounts(&[(1, "user@test.com", AuthKind::Oauth)]);
+        sequence::save(&seq).unwrap();
+
+        let result = refresh(Some("1"), true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("--all"));
     }
 }
