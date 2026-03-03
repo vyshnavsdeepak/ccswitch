@@ -87,6 +87,9 @@ enum Commands {
     Refresh {
         /// Account number or email to refresh (optional; uses active account if omitted)
         account: Option<String>,
+        /// Refresh all OAuth accounts that are expired or expire within 24 h
+        #[arg(long)]
+        all: bool,
     },
 
     /// Set a short alias for an account
@@ -127,8 +130,8 @@ fn run() -> Result<()> {
         Some(Commands::Status) => accounts::status(),
         Some(Commands::Switch { account: None }) => accounts::switch_next(),
         Some(Commands::Switch { account: Some(id) }) => accounts::switch_to(&id),
-        Some(Commands::Refresh { account }) => {
-            accounts::refresh(account.as_deref())
+        Some(Commands::Refresh { account, all }) => {
+            accounts::refresh(account.as_deref(), all)
         }
         Some(Commands::Alias { account, name }) => accounts::set_alias(&account, &name),
     }
