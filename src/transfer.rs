@@ -39,6 +39,8 @@ fn default_empty_object() -> String {
 // ── export ────────────────────────────────────────────────────────────────────
 
 pub fn export(account: Option<&str>, all: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
     if all && account.is_some() {
         anyhow::bail!("--all and --account are mutually exclusive");
     }
@@ -56,6 +58,9 @@ pub fn export(account: Option<&str>, all: bool) -> Result<()> {
             .resolve(id)
             .with_context(|| format!("Account '{id}' not found"))?;
         vec![num]
+    } else if std::io::stdin().is_terminal() {
+        // Interactive picker — show the account list and let the user choose.
+        pick_accounts_interactive(&seq)?
     } else {
         let num = seq
             .active_account_number
@@ -116,7 +121,15 @@ pub fn export(account: Option<&str>, all: bool) -> Result<()> {
     let blob = STANDARD.encode(json.as_bytes());
 
     println!();
-    if copy_to_clipboard(&blob) {
+    let use_file = if std::io::stdin().is_terminal() {
+        pick_destination_interactive()
+    } else {
+        false
+    };
+
+    if use_file {
+        offer_write_to_file(&blob)?;
+    } else if copy_to_clipboard(&blob) {
         println!(
             "  {}  Copied to clipboard — run {} on the remote and paste.\n",
             "✓".green().bold(),
@@ -127,6 +140,74 @@ pub fn export(account: Option<&str>, all: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── interactive pickers ───────────────────────────────────────────────────────
+
+/// Print the account list and ask the user which accounts to export.
+/// Returns the resolved account numbers.
+fn pick_accounts_interactive(seq: &crate::sequence::SequenceFile) -> Result<Vec<u32>> {
+    use std::io::Write;
+
+    // Print account list.
+    println!("  {}\n", "Accounts:".bold());
+    for &num in &seq.sequence {
+        let Some(entry) = seq.accounts.get(&num.to_string()) else {
+            continue;
+        };
+        let active_marker = if seq.active_account_number == Some(num) {
+            format!("▶ {:>2}", num).green().bold().to_string()
+        } else {
+            format!("  {:>2}", num).dimmed().to_string()
+        };
+        println!("  {}  {}", active_marker, entry.email);
+    }
+
+    println!();
+    print!(
+        "  Export which account? [{} for all, Enter for active]: ",
+        "all".cyan()
+    );
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    if input.eq_ignore_ascii_case("all") {
+        return Ok(seq.sequence.clone());
+    }
+
+    if input.is_empty() {
+        let num = seq
+            .active_account_number
+            .context("No active account. Specify an account number.")?;
+        return Ok(vec![num]);
+    }
+
+    let num = seq
+        .resolve(input)
+        .with_context(|| format!("Account '{input}' not found"))?;
+    Ok(vec![num])
+}
+
+/// Ask whether to copy to clipboard or write to a file.
+/// Returns true if the user chose file.
+fn pick_destination_interactive() -> bool {
+    use std::io::Write;
+
+    print!(
+        "  Destination? [{} / {}] [default: clipboard]: ",
+        "c".cyan().bold(),
+        "f".cyan().bold()
+    );
+    let _ = std::io::stdout().flush();
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_lowercase().as_str(), "f" | "file")
 }
 
 // ── clipboard / file helpers ──────────────────────────────────────────────────
