@@ -64,7 +64,13 @@ pub fn export(account: Option<&str>, all: bool) -> Result<()> {
     };
 
     // Determine active_num for the payload.
-    let active_num = seq.active_account_number.unwrap_or_else(|| nums[0]);
+    // Only use the global active account if it is actually in the export set;
+    // otherwise fall back to the first exported account (e.g. --account 2 while
+    // account 1 is active should mark account 2 as active in the blob).
+    let active_num = seq
+        .active_account_number
+        .filter(|n| nums.contains(n))
+        .unwrap_or(nums[0]);
 
     // Build account export entries.
     let mut account_exports: Vec<AccountExport> = Vec::new();
