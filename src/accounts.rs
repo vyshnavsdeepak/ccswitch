@@ -367,6 +367,68 @@ fn token_default_label() -> String {
     format!("token-{:08X}", ts)
 }
 
+// ── Re-auth helpers ───────────────────────────────────────────────────────────
+
+/// Returns true if the error is caused by an expired/revoked refresh token
+/// (OAuth `invalid_grant`).
+pub(crate) fn is_invalid_grant_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("invalid_grant") || msg.contains("Refresh token expired")
+}
+
+/// Interactive CLI prompt shown when a refresh token is permanently invalid.
+/// Prints re-auth instructions, then offers to remove the account.
+pub(crate) fn interactive_reauth_prompt(num: u32, email: &str) -> Result<()> {
+    println!();
+    println!(
+        "  {} Refresh token for Account {} ({}) has expired (invalid_grant).",
+        "!".red().bold(),
+        num,
+        email.yellow()
+    );
+    println!(
+        "  {} The token cannot be renewed automatically — \
+         you need to log in again.",
+        " ".normal()
+    );
+    println!();
+    println!("  To re-authenticate this account:");
+    println!(
+        "    {}  {}  {}",
+        "1.".cyan().bold(),
+        "Switch to it:   ",
+        format!("ccswitch switch {}", num).cyan().bold()
+    );
+    println!(
+        "    {}  {}",
+        "2.".cyan().bold(),
+        "Open Claude Code and log in (run: claude)"
+    );
+    println!(
+        "    {}  {}  {}",
+        "3.".cyan().bold(),
+        "Save the session:",
+        "ccswitch add".cyan().bold()
+    );
+    println!();
+
+    print!("  Remove Account {} ({}) now? [y/N] ", num, email);
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    if matches!(input.trim(), "y" | "Y") {
+        let msg = core_remove(num, email)?;
+        println!("\n  {} {}", "✓".green().bold(), msg);
+    } else {
+        println!("  {} Kept — re-authenticate when ready.", "·".dimmed());
+    }
+    println!();
+
+    Ok(())
+}
+
 // ── Refresh OAuth token ───────────────────────────────────────────────────────
 
 pub(crate) fn core_refresh(target_num: u32) -> Result<String> {
@@ -447,8 +509,20 @@ pub fn refresh(identifier: Option<&str>, all: bool) -> Result<()> {
     };
 
     println!();
-    let msg = core_refresh(target_num)?;
-    println!("  {} {}\n", "✓".green().bold(), msg);
+    match core_refresh(target_num) {
+        Ok(msg) => {
+            println!("  {} {}\n", "✓".green().bold(), msg);
+        }
+        Err(e) if is_invalid_grant_error(&e) => {
+            let email = seq
+                .accounts
+                .get(&target_num.to_string())
+                .map(|entry| entry.email.clone())
+                .unwrap_or_default();
+            interactive_reauth_prompt(target_num, &email)?;
+        }
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
@@ -1173,6 +1247,32 @@ mod tests {
         test_utils::TestEnv,
     };
     use std::fs;
+
+    // ── is_invalid_grant_error ────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_invalid_grant_error_http_response() {
+        let e = anyhow::anyhow!("Token refresh failed (HTTP 400): invalid_grant: Refresh token not found");
+        assert!(is_invalid_grant_error(&e));
+    }
+
+    #[test]
+    fn test_is_invalid_grant_error_transformed_message() {
+        let e = anyhow::anyhow!("Refresh token expired for Account 2 (user@test.com).");
+        assert!(is_invalid_grant_error(&e));
+    }
+
+    #[test]
+    fn test_is_invalid_grant_error_network_error() {
+        let e = anyhow::anyhow!("Token refresh request failed: connection refused");
+        assert!(!is_invalid_grant_error(&e));
+    }
+
+    #[test]
+    fn test_is_invalid_grant_error_http_500() {
+        let e = anyhow::anyhow!("Token refresh failed (HTTP 500): internal server error");
+        assert!(!is_invalid_grant_error(&e));
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
