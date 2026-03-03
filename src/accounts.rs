@@ -36,6 +36,13 @@ pub(crate) fn core_add() -> Result<String> {
     credentials::write_backup(account_num, &email, &live_creds)?;
     write_config_backup(account_num, &email, &live_config_str)?;
 
+    // Record the credential format fingerprint so future switches/refreshes
+    // can detect if Claude Code has changed its credential schema.
+    let fp = credentials::credential_field_fingerprint(&live_creds);
+    if !fp.is_empty() {
+        seq.format_fingerprint = Some(fp);
+    }
+
     seq.accounts.insert(
         account_num.to_string(),
         AccountEntry {
@@ -86,6 +93,7 @@ pub(crate) fn core_switch(target_num: u32) -> Result<String> {
     // Token accounts: skip — the token is static and was already stored during `add`
     if current_auth_kind == AuthKind::Oauth {
         let live_creds = credentials::read_live().context("Cannot read current credentials")?;
+        warn_if_format_changed(&seq, &live_creds);
         let live_config = config::load().context("Cannot read current Claude config")?;
         let live_config_str = serde_json::to_string_pretty(&live_config)?;
 
@@ -385,6 +393,7 @@ pub(crate) fn core_refresh(target_num: u32) -> Result<String> {
         credentials::read_backup(target_num, &entry.email)
             .with_context(|| format!("Cannot read backup credentials for Account {target_num}"))?
     };
+    warn_if_format_changed(&seq, &creds);
 
     let new_creds = credentials::refresh_oauth_creds(&creds).map_err(|e| {
         // Distinguish between a bad refresh token (needs full re-login) and network/other errors
@@ -1118,6 +1127,23 @@ pub(crate) fn read_config_backup(num: u32, email: &str) -> Result<String> {
 }
 
 // ── Session expiry helper ─────────────────────────────────────────────────────
+
+/// Compare the fingerprint of `creds` against the stored one in `seq`.
+/// Prints a warning to stderr when they differ.
+fn warn_if_format_changed(seq: &SequenceFile, creds: &str) {
+    let Some(stored_fp) = seq.format_fingerprint.as_deref() else {
+        return;
+    };
+    let live_fp = credentials::credential_field_fingerprint(creds);
+    if !live_fp.is_empty() && live_fp != stored_fp {
+        eprintln!(
+            "\n  {} Claude Code may have changed its credential format. \
+             ccswitch may not work correctly. \
+             Please check https://github.com/vyshnavsdeepak/ccswitch/issues for updates.",
+            "Warning:".yellow().bold()
+        );
+    }
+}
 
 /// Return a short badge string describing session expiry for display in lists.
 /// Empty string means the session is healthy and no badge is needed.

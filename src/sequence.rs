@@ -33,6 +33,14 @@ pub struct SequenceFile {
     pub accounts: HashMap<String, AccountEntry>,
     #[serde(default)]
     pub aliases: HashMap<String, u32>,
+    /// Fingerprint of the `claudeAiOauth` key set recorded at `ccswitch add`
+    /// time.  Used to detect Claude Code credential-format drift.
+    #[serde(
+        rename = "formatFingerprint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub format_fingerprint: Option<String>,
 }
 
 impl SequenceFile {
@@ -266,5 +274,38 @@ mod tests {
         let seq = load().unwrap();
         assert!(seq.accounts.is_empty());
         assert_eq!(seq.active_account_number, None);
+    }
+
+    #[test]
+    fn test_format_fingerprint_default_none() {
+        let seq = SequenceFile::default();
+        assert_eq!(seq.format_fingerprint, None);
+    }
+
+    #[test]
+    fn test_format_fingerprint_roundtrip() {
+        let _env = crate::test_utils::TestEnv::new();
+        let mut seq = SequenceFile::default();
+        seq.format_fingerprint =
+            Some("accessToken|expiresAt|refreshToken|scopes".to_string());
+        save(&seq).unwrap();
+
+        let loaded = load().unwrap();
+        assert_eq!(
+            loaded.format_fingerprint,
+            Some("accessToken|expiresAt|refreshToken|scopes".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_fingerprint_absent_in_json_deserialises_as_none() {
+        let _env = crate::test_utils::TestEnv::new();
+        // Write a sequence.json that has no formatFingerprint key
+        let json = r#"{"activeAccountNumber":1,"lastUpdated":"2024-01-01T00:00:00Z","sequence":[1],"accounts":{}}"#;
+        let path = sequence_path();
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = load().unwrap();
+        assert_eq!(loaded.format_fingerprint, None);
     }
 }

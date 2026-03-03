@@ -281,6 +281,27 @@ pub fn refresh_oauth_creds(creds_json: &str) -> Result<String> {
     serde_json::to_string(&v).context("Failed to serialize updated credentials")
 }
 
+// ── Format sentinel ───────────────────────────────────────────────────────────
+
+/// Compute a fingerprint of the top-level keys inside `claudeAiOauth`.
+///
+/// Returns a sorted, `|`-joined string of the key names, e.g.
+/// `"accessToken|expiresAt|refreshToken|scopes"`.
+/// Returns an empty string when the JSON cannot be parsed or `claudeAiOauth`
+/// is absent (e.g. static-token accounts).
+pub fn credential_field_fingerprint(creds_str: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(creds_str) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let Some(obj) = v.get("claudeAiOauth").and_then(|o| o.as_object()) else {
+        return String::new();
+    };
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.join("|")
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn account_service(num: u32, email: &str) -> String {
@@ -425,5 +446,68 @@ mod tests {
     fn test_oauth_secs_remaining_none_for_token() {
         let creds = r#"{"token": "sk-ant-oat01-abc"}"#;
         assert_eq!(oauth_secs_remaining(creds), None);
+    }
+
+    // ── credential_field_fingerprint ─────────────────────────────────────────
+
+    #[test]
+    fn test_fingerprint_standard_oauth() {
+        let creds = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "tok",
+                "refreshToken": "rtok",
+                "expiresAt": 1_234_567_890_i64,
+                "scopes": []
+            }
+        })
+        .to_string();
+        assert_eq!(
+            credential_field_fingerprint(&creds),
+            "accessToken|expiresAt|refreshToken|scopes"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_sorted_regardless_of_json_order() {
+        let creds1 = r#"{"claudeAiOauth": {"b": 1, "a": 2}}"#;
+        let creds2 = r#"{"claudeAiOauth": {"a": 2, "b": 1}}"#;
+        assert_eq!(
+            credential_field_fingerprint(creds1),
+            credential_field_fingerprint(creds2)
+        );
+        assert_eq!(credential_field_fingerprint(creds1), "a|b");
+    }
+
+    #[test]
+    fn test_fingerprint_non_oauth_returns_empty() {
+        let creds = r#"{"token": "sk-ant-oat01-abc"}"#;
+        assert_eq!(credential_field_fingerprint(creds), "");
+    }
+
+    #[test]
+    fn test_fingerprint_invalid_json_returns_empty() {
+        assert_eq!(credential_field_fingerprint("not json at all"), "");
+    }
+
+    #[test]
+    fn test_fingerprint_detects_added_field() {
+        let original = r#"{"claudeAiOauth": {"accessToken": "t", "refreshToken": "r"}}"#;
+        let changed =
+            r#"{"claudeAiOauth": {"accessToken": "t", "refreshToken": "r", "newField": "x"}}"#;
+        assert_ne!(
+            credential_field_fingerprint(original),
+            credential_field_fingerprint(changed)
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_detects_removed_field() {
+        let original =
+            r#"{"claudeAiOauth": {"accessToken": "t", "refreshToken": "r", "expiresAt": 1}}"#;
+        let changed = r#"{"claudeAiOauth": {"accessToken": "t", "refreshToken": "r"}}"#;
+        assert_ne!(
+            credential_field_fingerprint(original),
+            credential_field_fingerprint(changed)
+        );
     }
 }
