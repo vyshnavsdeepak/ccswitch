@@ -957,6 +957,81 @@ fn do_switch(target_num: u32) -> Result<()> {
     Ok(())
 }
 
+// ── Edit account label ────────────────────────────────────────────────────────
+
+pub(crate) fn core_edit_account(num: u32, old_email: &str, new_label: &str) -> Result<String> {
+    // Read existing credentials backup before touching anything
+    let creds = credentials::read_backup(num, old_email)
+        .with_context(|| format!("Cannot read credentials backup for Account {num}"))?;
+
+    // Write new backup under new label, then delete old one
+    credentials::write_backup(num, new_label, &creds)?;
+    credentials::delete_backup(num, old_email)?;
+
+    // Migrate config backup (best-effort — missing backup is not fatal)
+    if let Ok(config_str) = read_config_backup(num, old_email) {
+        write_config_backup(num, new_label, &config_str)?;
+        let _ = std::fs::remove_file(config_backup_path(num, old_email));
+    }
+
+    // Update sequence.json
+    let mut seq = sequence::load()?;
+    if let Some(entry) = seq.accounts.get_mut(&num.to_string()) {
+        entry.email = new_label.to_string();
+    }
+    seq.last_updated = now_utc();
+    sequence::save(&seq)?;
+
+    Ok(format!(
+        "Renamed Account {num}: '{}' → '{}'",
+        old_email, new_label
+    ))
+}
+
+pub fn edit_account(identifier: &str, new_label: &str) -> Result<()> {
+    let seq = sequence::load()?;
+
+    if seq.accounts.is_empty() {
+        bail!("No accounts managed yet. Run `ccswitch add` first.");
+    }
+
+    let num = seq
+        .resolve(identifier)
+        .with_context(|| format!("No account found matching '{identifier}'"))?;
+
+    let entry = seq
+        .accounts
+        .get(&num.to_string())
+        .cloned()
+        .with_context(|| format!("Account {num} does not exist"))?;
+
+    let old_email = entry.email.clone();
+
+    if old_email == new_label {
+        println!(
+            "\n  {} Account {} already has label '{}'.\n",
+            "·".cyan(),
+            num,
+            new_label
+        );
+        return Ok(());
+    }
+
+    if let Some(existing_num) = seq.find_by_email(new_label) {
+        if existing_num != num {
+            bail!(
+                "Label '{}' is already used by Account {}",
+                new_label,
+                existing_num
+            );
+        }
+    }
+
+    let msg = core_edit_account(num, &old_email, new_label)?;
+    println!("\n  {} {}\n", "✓".green().bold(), msg);
+    Ok(())
+}
+
 // ── Credential helpers ────────────────────────────────────────────────────────
 
 /// Check whether a token value is already stored in any managed account.
@@ -1578,5 +1653,142 @@ mod tests {
         let result = refresh(Some("1"), true);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("--all"));
+    }
+
+    // ── Tests: core_edit_account ──────────────────────────────────────────────
+
+    fn setup_single_oauth(env: &TestEnv, num: u32, email: &str) {
+        let creds = make_oauth_creds(email);
+        let cfg = make_oauth_config(email, &format!("uuid-{num}"));
+
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert(num.to_string(), entry(email, AuthKind::Oauth));
+        seq.sequence = vec![num];
+        seq.active_account_number = Some(num);
+        seq.last_updated = sequence::now_utc();
+        sequence::save(&seq).unwrap();
+
+        write_live_file(env, &creds);
+        write_config_file(env, &cfg);
+
+        credentials::write_backup(num, email, &creds).unwrap();
+        fs::write(
+            config_backup_path(num, email),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_core_edit_renames_label() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 1, "old@test.com");
+
+        let msg = core_edit_account(1, "old@test.com", "new@test.com").unwrap();
+        assert!(msg.contains("old@test.com"), "unexpected: {msg}");
+        assert!(msg.contains("new@test.com"), "unexpected: {msg}");
+
+        // sequence.json updated
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.accounts["1"].email, "new@test.com");
+
+        // New credentials backup exists, old one gone
+        assert!(
+            credentials::read_backup(1, "new@test.com").is_ok(),
+            "new backup should exist"
+        );
+        assert!(
+            credentials::read_backup(1, "old@test.com").is_err(),
+            "old backup should be gone"
+        );
+
+        // New config backup exists
+        assert!(
+            read_config_backup(1, "new@test.com").is_ok(),
+            "new config backup should exist"
+        );
+        assert!(
+            !config_backup_path(1, "old@test.com").exists(),
+            "old config backup should be gone"
+        );
+    }
+
+    #[test]
+    fn test_core_edit_active_account_stays_active() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 1, "active@test.com");
+
+        core_edit_account(1, "active@test.com", "renamed@test.com").unwrap();
+
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.active_account_number, Some(1));
+        assert_eq!(seq.accounts["1"].email, "renamed@test.com");
+    }
+
+    #[test]
+    fn test_core_edit_missing_backup_returns_error() {
+        let _env = TestEnv::new();
+
+        // Sequence has an account but no credentials backup on disk
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), entry("ghost@test.com", AuthKind::Oauth));
+        seq.sequence = vec![1];
+        seq.active_account_number = Some(1);
+        seq.last_updated = sequence::now_utc();
+        sequence::save(&seq).unwrap();
+
+        let err = core_edit_account(1, "ghost@test.com", "new@test.com").unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot read credentials backup"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_edit_account_conflict_with_existing() {
+        let env = TestEnv::new();
+        setup_two_oauth(&env);
+
+        // Try to rename account 1 to the email already used by account 2
+        let err = edit_account("1", "acct2@test.com").unwrap_err();
+        assert!(
+            err.to_string().contains("already used by Account"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_edit_account_no_op_same_label() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 1, "same@test.com");
+
+        // Should succeed without error and leave the sequence unchanged
+        edit_account("1", "same@test.com").unwrap();
+
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.accounts["1"].email, "same@test.com");
+    }
+
+    #[test]
+    fn test_edit_account_resolve_by_number() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 3, "user@test.com");
+
+        let result = edit_account("3", "updated@test.com");
+        assert!(result.is_ok(), "unexpected: {:?}", result);
+
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.accounts["3"].email, "updated@test.com");
+    }
+
+    #[test]
+    fn test_edit_account_resolve_by_email() {
+        let env = TestEnv::new();
+        setup_single_oauth(&env, 2, "byemail@test.com");
+
+        edit_account("byemail@test.com", "changed@test.com").unwrap();
+
+        let seq = sequence::load().unwrap();
+        assert_eq!(seq.accounts["2"].email, "changed@test.com");
     }
 }
