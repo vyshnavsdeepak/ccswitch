@@ -131,24 +131,26 @@ pub fn export(account: Option<&str>, all: bool) -> Result<()> {
 
 // ── import ────────────────────────────────────────────────────────────────────
 
-pub fn import() -> Result<()> {
-    let raw = rpassword::prompt_password("  Paste export blob: ")
-        .context("Failed to read blob from terminal")?;
-    let raw = raw.trim();
-
+fn parse_payload(blob: &str) -> Result<ExportPayload> {
     let decoded = STANDARD
-        .decode(raw.as_bytes())
+        .decode(blob.trim().as_bytes())
         .context("Invalid base64 — make sure you pasted the complete blob")?;
-
     let payload: ExportPayload = serde_json::from_slice(&decoded)
         .context("Failed to parse export blob — it may be corrupted or from an incompatible version")?;
-
     if payload.version != 1 {
         anyhow::bail!(
             "Unsupported export version {} (this version of ccswitch only supports version 1)",
             payload.version
         );
     }
+    Ok(payload)
+}
+
+pub fn import() -> Result<()> {
+    let raw = rpassword::prompt_password("  Paste export blob: ")
+        .context("Failed to read blob from terminal")?;
+
+    let payload = parse_payload(&raw)?;
 
     sequence::setup_dirs()?;
 
@@ -376,7 +378,8 @@ mod tests {
 
     #[test]
     fn test_import_version_mismatch_returns_error() {
-        // Build a payload with version 99.
+        // Build a payload with version 99, encode it, then run it through
+        // parse_payload() to verify the version guard actually fires.
         let payload = ExportPayload {
             version: 99,
             exported_at: "2026-03-03T12:00:00Z".to_string(),
@@ -387,9 +390,11 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         let blob = STANDARD.encode(json.as_bytes());
 
-        // Decode and check version ourselves (mirrors what import() does after reading the blob).
-        let decoded = STANDARD.decode(blob.as_bytes()).unwrap();
-        let restored: ExportPayload = serde_json::from_slice(&decoded).unwrap();
-        assert_ne!(restored.version, 1, "version should be 99, not 1");
+        let result = parse_payload(&blob);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported export version 99"));
     }
 }
