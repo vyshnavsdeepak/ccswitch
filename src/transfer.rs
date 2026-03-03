@@ -188,13 +188,15 @@ pub fn import() -> Result<()> {
     credentials::write_live(&active_acct.credentials)
         .context("Failed to write live credentials")?;
 
-    // Merge oauthAccount from config backup into ~/.claude/.claude.json (best-effort).
+    // Merge oauthAccount from config backup into ~/.claude/.claude.json.
+    // On a fresh VM neither ~/.claude/.claude.json nor ~/.claude.json exist yet,
+    // so config::load() would fail.  Fall back to an empty object so oauthAccount
+    // is always written and Claude Code recognises the imported account.
     if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&active_acct.config) {
         if let Some(oauth_account) = config_json.get("oauthAccount").cloned() {
-            if let Ok(mut live_config) = crate::config::load() {
-                live_config["oauthAccount"] = oauth_account;
-                let _ = crate::config::save(&live_config);
-            }
+            let mut live_config = crate::config::load().unwrap_or_else(|_| serde_json::json!({}));
+            live_config["oauthAccount"] = oauth_account;
+            let _ = crate::config::save(&live_config);
         }
     }
 
