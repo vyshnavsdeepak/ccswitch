@@ -137,10 +137,17 @@ enum Commands {
         account: Option<String>,
         #[arg(long)]
         all: bool,
+        /// Upload encrypted blob to a private GitHub Gist and print the import command
+        #[arg(long)]
+        gist: bool,
     },
 
     /// Import accounts from an export blob (reads interactively — no shell history)
-    Import,
+    Import {
+        /// Download and decrypt from a GitHub Gist created by `export --gist`
+        #[arg(long, value_name = "ID")]
+        gist: Option<String>,
+    },
 }
 
 fn main() {
@@ -183,7 +190,13 @@ fn run() -> Result<()> {
         }
         Some(Commands::Doctor) => accounts::doctor(),
         Some(Commands::Update) => update::update(),
-        Some(Commands::Export { account, all }) => transfer::export(account.as_deref(), all),
-        Some(Commands::Import) => transfer::import(),
+        Some(Commands::Export { account, all, gist: true }) => {
+            transfer::export_gist(account.as_deref(), all)
+        }
+        Some(Commands::Export { account, all, gist: false }) => {
+            transfer::export(account.as_deref(), all)
+        }
+        Some(Commands::Import { gist: Some(id) }) => transfer::import_gist(&id),
+        Some(Commands::Import { gist: None }) => transfer::import(),
     }
 }
