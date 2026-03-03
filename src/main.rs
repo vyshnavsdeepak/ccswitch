@@ -51,11 +51,24 @@ enum Commands {
         /// Account number or email to switch to (optional; rotates if omitted)
         account: Option<String>,
     },
+
+    /// Refresh the OAuth session token for an account (active account if none given)
+    Refresh {
+        /// Account number or email to refresh (optional; uses active account if omitted)
+        account: Option<String>,
+    },
 }
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("\n  {} {}\n", "Error:".red().bold(), e);
+        eprintln!("\n  {} {}", "Error:".red().bold(), e);
+        // Print cause chain if present
+        let mut source = e.source();
+        while let Some(cause) = source {
+            eprintln!("    {} {}", "caused by:".dimmed(), cause);
+            source = cause.source();
+        }
+        eprintln!();
         std::process::exit(1);
     }
 }
@@ -75,5 +88,8 @@ fn run() -> Result<()> {
         Some(Commands::Status) => accounts::status(),
         Some(Commands::Switch { account: None }) => accounts::switch_next(),
         Some(Commands::Switch { account: Some(id) }) => accounts::switch_to(&id),
+        Some(Commands::Refresh { account }) => {
+            accounts::refresh(account.as_deref())
+        }
     }
 }

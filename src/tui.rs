@@ -27,9 +27,7 @@ enum Mode {
     ConfirmRemove { num: u32, email: String },
     ConfirmAdd { email: String },
     /// Switch (or other action) completed.
-    /// `needs_new_shell`: true when the active account is a token account —
-    /// the user must open a new shell for CLAUDE_CODE_OAUTH_TOKEN to update.
-    Done { needs_new_shell: bool },
+    Done,
 }
 
 struct Flash {
@@ -73,14 +71,13 @@ impl App {
     }
 
     /// Determine the active email for display.
-    /// OAuth users: read from live Claude config.
-    /// Token users: fall back to the seq state (no oauthAccount in config).
+    /// Prefers seq state so token accounts (and recently-switched accounts)
+    /// show correctly; falls back to live OAuth config.
     fn resolve_display_email(seq: &sequence::SequenceFile) -> Option<String> {
-        config::current_email().or_else(|| {
-            seq.active_account_number
-                .and_then(|num| seq.accounts.get(&num.to_string()))
-                .map(|e| e.email.clone())
-        })
+        seq.active_account_number
+            .and_then(|num| seq.accounts.get(&num.to_string()))
+            .map(|e| e.email.clone())
+            .or_else(config::current_email)
     }
 
     fn selected_num(&self) -> Option<u32> {
@@ -146,7 +143,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
                 Mode::ConfirmSwitch { .. }
                 | Mode::ConfirmRemove { .. }
                 | Mode::ConfirmAdd { .. } => handle_confirm(&mut app, key.code)?,
-                Mode::Done { .. } => {
+                Mode::Done => {
                     app.quit = true;
                 }
             }
@@ -239,14 +236,7 @@ fn handle_confirm(app: &mut App, key: KeyCode) -> Result<()> {
                     match accounts::core_switch(num) {
                         Ok(_) => {
                             app.reload()?;
-                            // Token accounts require a new shell for the env var to update
-                            let needs_new_shell = app
-                                .seq
-                                .accounts
-                                .get(&num.to_string())
-                                .map(|e| e.auth_kind == AuthKind::Token)
-                                .unwrap_or(false);
-                            app.mode = Mode::Done { needs_new_shell };
+                            app.mode = Mode::Done;
                         }
                         Err(e) => {
                             app.flash = Some(Flash {
@@ -494,13 +484,13 @@ fn render_list(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 fn render_help(f: &mut ratatui::Frame, app: &App, area: Rect) {
     match &app.mode {
-        Mode::Done { needs_new_shell } => {
+        Mode::Done => {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Green));
 
-            let mut spans = vec![
+            let spans = vec![
                 Span::styled(
                     "  ✓ Done  ·  ",
                     Style::default()
@@ -513,21 +503,11 @@ fn render_help(f: &mut ratatui::Frame, app: &App, area: Rect) {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(
+                    "  ·  [any key] quit",
+                    Style::default().fg(Color::Green),
+                ),
             ];
-
-            if *needs_new_shell {
-                spans.push(Span::styled(
-                    "  ·  open a new shell",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-
-            spans.push(Span::styled(
-                "  ·  [any key] quit",
-                Style::default().fg(Color::Green),
-            ));
 
             let text = Paragraph::new(Line::from(spans)).block(block);
             f.render_widget(text, area);

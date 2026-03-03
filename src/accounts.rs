@@ -117,10 +117,20 @@ pub(crate) fn core_switch(target_num: u32) -> Result<String> {
             config::save(&active_config).context("Failed to save merged config")?;
         }
         AuthKind::Token => {
-            // Update the active-token keychain slot — ~/.ccswitchrc reads from it
             let token = extract_access_token(&target_creds)?;
-            credentials::write_active_token(&token)
-                .context("Failed to update active-token slot")?;
+            // Write directly to the live credentials keychain so Claude Code
+            // picks it up on next restart — no CLAUDE_CODE_OAUTH_TOKEN needed.
+            credentials::write_live_token(&token)
+                .context("Failed to write token to live credentials")?;
+            // Keep ccswitch-active-token updated for verification purposes.
+            let _ = credentials::write_active_token(&token);
+            // Clear oauthAccount from config — token accounts have no profile.
+            if let Ok(mut cfg) = config::load() {
+                if let Some(obj) = cfg.as_object_mut() {
+                    obj.remove("oauthAccount");
+                }
+                let _ = config::save(&cfg);
+            }
         }
     }
 
@@ -272,8 +282,11 @@ fn token_add_flow() -> Result<()> {
         .unwrap_or_else(|_| "{}".to_string());
     write_config_backup(account_num, &email, &config_backup)?;
 
-    // Write the active-token keychain/file slot
-    credentials::write_active_token(&token)?;
+    // Write token to the live credentials keychain so Claude Code reads it
+    // directly — no CLAUDE_CODE_OAUTH_TOKEN env var needed.
+    credentials::write_live_token(&token)?;
+    // Also keep ccswitch-active-token for verification.
+    let _ = credentials::write_active_token(&token);
 
     // Create ~/.ccswitchrc if this is the first token account
     let newly_created = credentials::ensure_ccswitchrc()?;
@@ -321,8 +334,8 @@ fn token_add_flow() -> Result<()> {
             rc_path.display().to_string().cyan().bold()
         );
         println!();
-        println!("  Then open a new terminal — ccswitch will set");
-        println!("  CLAUDE_CODE_OAUTH_TOKEN automatically on every switch.");
+        println!("  This clears CLAUDE_CODE_OAUTH_TOKEN so Claude Code");
+        println!("  reads credentials from the keychain on every restart.");
         println!(
             "  {}",
             "────────────────────────────────────────────────────────────".dimmed()
@@ -344,6 +357,82 @@ fn token_default_label() -> String {
     // Use a hex timestamp so each invocation gets a distinct default
     let ts = chrono::Utc::now().timestamp() as u32;
     format!("token-{:08X}", ts)
+}
+
+// ── Refresh OAuth token ───────────────────────────────────────────────────────
+
+pub(crate) fn core_refresh(target_num: u32) -> Result<String> {
+    let seq = sequence::load()?;
+
+    let entry = seq
+        .accounts
+        .get(&target_num.to_string())
+        .cloned()
+        .with_context(|| format!("Account {target_num} does not exist"))?;
+
+    if entry.auth_kind != AuthKind::Oauth {
+        return Ok(format!(
+            "Account {} uses a static token — nothing to refresh.",
+            entry.email
+        ));
+    }
+
+    let is_active = seq.active_account_number == Some(target_num);
+
+    let creds = if is_active {
+        credentials::read_live().context("Cannot read current credentials")?
+    } else {
+        credentials::read_backup(target_num, &entry.email)
+            .with_context(|| format!("Cannot read backup credentials for Account {target_num}"))?
+    };
+
+    let new_creds = credentials::refresh_oauth_creds(&creds).map_err(|e| {
+        // Distinguish between a bad refresh token (needs full re-login) and network/other errors
+        let msg = e.to_string();
+        if msg.contains("invalid_grant") || msg.contains("not found or invalid") {
+            anyhow::anyhow!(
+                "Refresh token expired for Account {} ({}).\n  \
+                 Re-login: switch to this account (`ccswitch switch {}`), \
+                 then run `claude` to authenticate and `ccswitch add` to save the new session.",
+                target_num, entry.email, target_num
+            )
+        } else {
+            anyhow::anyhow!("Failed to refresh token for Account {target_num}: {e}")
+        }
+    })?;
+
+    credentials::write_backup(target_num, &entry.email, &new_creds)?;
+    if is_active {
+        credentials::write_live(&new_creds).context("Failed to write refreshed credentials")?;
+    }
+
+    Ok(format!("Refreshed token for Account {} ({})", target_num, entry.email))
+}
+
+pub fn refresh(identifier: Option<&str>) -> Result<()> {
+    let seq = sequence::load()?;
+
+    if seq.accounts.is_empty() {
+        bail!("No accounts managed yet. Run `ccswitch add` first.");
+    }
+
+    let target_num = if let Some(id) = identifier {
+        seq.resolve(id)
+            .with_context(|| format!("No account found matching '{id}'"))?
+    } else {
+        seq.active_account_number
+            .or_else(|| {
+                config::current_email()
+                    .as_deref()
+                    .and_then(|e| seq.find_by_email(e))
+            })
+            .context("No active account found. Pass an account number or email.")?
+    };
+
+    println!();
+    let msg = core_refresh(target_num)?;
+    println!("  {} {}\n", "✓".green().bold(), msg);
+    Ok(())
 }
 
 // ── Remove account ────────────────────────────────────────────────────────────
@@ -419,27 +508,55 @@ pub fn list() -> Result<()> {
         };
 
         let is_active = active_num == Some(num);
-        let badge = if entry.auth_kind == AuthKind::Token {
+
+        // Read credentials to check session expiry (best-effort; skip on error)
+        let expiry_badge: Option<String> = if entry.auth_kind == AuthKind::Oauth {
+            let creds = if is_active {
+                credentials::read_live().ok()
+            } else {
+                credentials::read_backup(num, &entry.email).ok()
+            };
+            creds.map(|c| session_expiry_badge(&c))
+        } else {
+            None
+        };
+
+        let kind_badge = if entry.auth_kind == AuthKind::Token {
             " [token]"
         } else {
             ""
         };
 
         if is_active {
-            println!(
-                "  {}  {}{}  {}",
+            print!(
+                "  {}  {}{}",
                 format!("▶ {num:>2}").green().bold(),
                 entry.email.green().bold(),
-                badge.green().dimmed(),
-                "(active)".green().dimmed()
+                kind_badge.green().dimmed(),
             );
+            if let Some(ref eb) = expiry_badge {
+                if eb.starts_with("[expired]") {
+                    print!("  {}", eb.red().bold());
+                } else if !eb.is_empty() {
+                    print!("  {}", eb.yellow());
+                }
+            }
+            println!("  {}", "(active)".green().dimmed());
         } else {
-            println!(
+            print!(
                 "  {}  {}{}",
                 format!("  {num:>2}").dimmed(),
                 entry.email,
-                badge.dimmed()
+                kind_badge.dimmed()
             );
+            if let Some(ref eb) = expiry_badge {
+                if eb.starts_with("[expired]") {
+                    print!("  {}", eb.red().bold());
+                } else if !eb.is_empty() {
+                    print!("  {}", eb.yellow());
+                }
+            }
+            println!();
         }
     }
 
@@ -477,16 +594,40 @@ pub fn status() -> Result<()> {
             }
         }
         Some((num, entry)) => {
-            let badge = if entry.auth_kind == AuthKind::Token {
+            let kind_badge = if entry.auth_kind == AuthKind::Token {
                 " [token]"
             } else {
                 ""
             };
+
+            let expiry_str = if entry.auth_kind == AuthKind::Oauth {
+                credentials::read_live().ok().map(|c| {
+                    match credentials::oauth_secs_remaining(&c) {
+                        None => String::new(),
+                        Some(secs) if secs <= 0 => " — session expired".red().bold().to_string(),
+                        Some(secs) => {
+                            let days = secs / 86400;
+                            let hours = (secs % 86400) / 3600;
+                            if days > 7 {
+                                format!(" — expires in {}d", days).dimmed().to_string()
+                            } else if days >= 1 {
+                                format!(" — expires in {}d {}h", days, hours).yellow().to_string()
+                            } else {
+                                format!(" — expires in {}h", hours).yellow().bold().to_string()
+                            }
+                        }
+                    }
+                })
+            } else {
+                None
+            };
+
             println!(
-                "\n  {} {}{} {}\n",
+                "\n  {} {}{}{} {}\n",
                 "▶".green().bold(),
                 entry.email.bold(),
-                badge.dimmed(),
+                kind_badge.dimmed(),
+                expiry_str.as_deref().unwrap_or(""),
                 format!("(Account {num})").dimmed()
             );
         }
@@ -566,8 +707,6 @@ fn do_switch(target_num: u32) -> Result<()> {
         .cloned()
         .with_context(|| format!("Account {target_num} does not exist"))?;
     let target_email = target_entry.email.clone();
-    let target_is_token = target_entry.auth_kind == AuthKind::Token;
-
     // Determine display name for current account — handles both OAuth and token
     let current_slot_email = if let Some(num) = seq.active_account_number {
         seq.accounts
@@ -598,19 +737,15 @@ fn do_switch(target_num: u32) -> Result<()> {
 
     core_switch(target_num)?;
 
+    // Upgrade ~/.ccswitchrc to the new keychain-only format if needed.
+    let _ = credentials::ensure_ccswitchrc();
+
     list()?;
 
-    if target_is_token {
-        println!(
-            "  {} Restart Claude Code · open a new shell for token to take effect\n",
-            "✓".green().bold()
-        );
-    } else {
-        println!(
-            "  {} Restart Claude Code to apply.\n",
-            "✓".green().bold()
-        );
-    }
+    println!(
+        "  {} Restart Claude Code to apply.\n",
+        "✓".green().bold()
+    );
 
     Ok(())
 }
@@ -698,4 +833,24 @@ pub(crate) fn read_config_backup(num: u32, email: &str) -> Result<String> {
     let path = config_backup_path(num, email);
     std::fs::read_to_string(&path)
         .with_context(|| format!("Cannot read config backup from {}", path.display()))
+}
+
+// ── Session expiry helper ─────────────────────────────────────────────────────
+
+/// Return a short badge string describing session expiry for display in lists.
+/// Empty string means the session is healthy and no badge is needed.
+fn session_expiry_badge(creds_json: &str) -> String {
+    match credentials::oauth_secs_remaining(creds_json) {
+        None => String::new(),
+        Some(secs) if secs <= 0 => "[expired]".to_string(),
+        Some(secs) if secs <= 3 * 24 * 3600 => {
+            let hours = secs / 3600;
+            format!("[~{}h]", hours)
+        }
+        Some(secs) if secs <= 7 * 24 * 3600 => {
+            let days = secs / 86400;
+            format!("[~{}d]", days)
+        }
+        _ => String::new(),
+    }
 }
