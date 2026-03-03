@@ -260,15 +260,21 @@ fn copy_to_clipboard(blob: &str) -> bool {
 fn write_blob_to_file(blob: &str) -> Result<()> {
     use std::io::Write;
 
-    print!("  File path [Enter to cancel]: ");
+    let default_path = dirs::home_dir()
+        .context("Cannot find home directory")?
+        .join("ccswitch-export.blob");
+    let default_str = default_path.display().to_string();
+
+    print!("  File path [{}]: ", default_str.dimmed());
     std::io::stdout().flush()?;
 
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     let raw = input.trim();
 
+    // Empty input → use the default.
     if raw.is_empty() {
-        anyhow::bail!("Export cancelled.");
+        return write_blob_to_path(blob, &default_path);
     }
 
     // Expand a leading ~ manually (std::path doesn't do it).
@@ -280,13 +286,17 @@ fn write_blob_to_file(blob: &str) -> Result<()> {
         std::path::PathBuf::from(raw)
     };
 
-    std::fs::write(&path, blob)
+    write_blob_to_path(blob, &path)
+}
+
+fn write_blob_to_path(blob: &str, path: &std::path::Path) -> Result<()> {
+    std::fs::write(path, blob)
         .with_context(|| format!("Cannot write to {}", path.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
 
     println!(
