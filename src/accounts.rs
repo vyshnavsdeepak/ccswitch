@@ -774,6 +774,52 @@ fn do_switch(target_num: u32) -> Result<()> {
         return Ok(());
     }
 
+    // If the target is an OAuth account with an expired session, warn and
+    // optionally refresh before switching.
+    if target_entry.auth_kind == AuthKind::Oauth {
+        if let Ok(backup_creds) = credentials::read_backup(target_num, &target_email) {
+            if !credentials::is_oauth_active(&backup_creds) {
+                println!(
+                    "\n  {} Account {} ({}) has an expired session.",
+                    "!".yellow().bold(),
+                    target_num,
+                    target_email
+                );
+
+                use std::io::IsTerminal;
+                if io::stdin().is_terminal() {
+                    print!("  Refresh now? [y/N] ");
+                    io::stdout().flush()?;
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    if matches!(input.trim(), "y" | "Y") {
+                        println!();
+                        match core_refresh(target_num) {
+                            Ok(msg) => println!("  {} {}\n", "✓".green().bold(), msg),
+                            Err(e) => {
+                                println!("  {} Refresh failed: {e}", "✗".red().bold());
+                                println!(
+                                    "  {} Switching anyway — Claude Code may reject the expired session.\n",
+                                    "!".yellow().bold()
+                                );
+                            }
+                        }
+                    } else {
+                        println!(
+                            "  {} Switching with expired session — Claude Code may reject it.\n",
+                            "!".yellow().bold()
+                        );
+                    }
+                } else {
+                    println!(
+                        "  {} Switching with expired session — Claude Code may reject it.\n",
+                        "!".yellow().bold()
+                    );
+                }
+            }
+        }
+    }
+
     println!(
         "\n  {} {}  {}  {}",
         "→".cyan().bold(),
@@ -1036,14 +1082,16 @@ mod tests {
 
     #[test]
     fn test_session_expiry_badge_hours() {
-        let ms = chrono::Utc::now().timestamp_millis() + 2 * 3600 * 1000_i64;
+        // Add a 60s buffer so integer division still yields 2h when the test runs.
+        let ms = chrono::Utc::now().timestamp_millis() + (2 * 3600 + 60) * 1000_i64;
         let creds = serde_json::json!({ "claudeAiOauth": { "expiresAt": ms } }).to_string();
         assert_eq!(session_expiry_badge(&creds), "[~2h]");
     }
 
     #[test]
     fn test_session_expiry_badge_days() {
-        let ms = chrono::Utc::now().timestamp_millis() + 4 * 86400 * 1000_i64;
+        // Add a 1h buffer so integer division still yields 4d when the test runs.
+        let ms = chrono::Utc::now().timestamp_millis() + (4 * 86400 + 3600) * 1000_i64;
         let creds = serde_json::json!({ "claudeAiOauth": { "expiresAt": ms } }).to_string();
         assert_eq!(session_expiry_badge(&creds), "[~4d]");
     }
@@ -1214,5 +1262,70 @@ mod tests {
             "sk-ant-oat01-acct1"
         );
         assert_eq!(sequence::load().unwrap().active_account_number, Some(1));
+    }
+
+    fn make_expired_oauth_creds(label: &str) -> String {
+        let expires = chrono::Utc::now().timestamp_millis() - 3_600_000_i64; // 1h ago
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": format!("sk-ant-oat01-{}", label),
+                "refreshToken": format!("sk-ant-ort01-{}", label),
+                "expiresAt": expires
+            }
+        })
+        .to_string()
+    }
+
+    /// In a non-interactive (non-tty) environment the expiry prompt is skipped
+    /// and do_switch proceeds with the expired session, completing successfully.
+    #[test]
+    fn test_do_switch_expired_oauth_skips_prompt_and_switches() {
+        let env = TestEnv::new();
+
+        let creds1 = make_oauth_creds("acct1");
+        let creds2_expired = make_expired_oauth_creds("acct2");
+        let cfg1 = make_oauth_config("acct1@test.com", "uuid1");
+        let cfg2 = make_oauth_config("acct2@test.com", "uuid2");
+
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), entry("acct1@test.com", AuthKind::Oauth));
+        seq.accounts.insert("2".into(), entry("acct2@test.com", AuthKind::Oauth));
+        seq.sequence = vec![1, 2];
+        seq.active_account_number = Some(1);
+        seq.last_updated = sequence::now_utc();
+        sequence::save(&seq).unwrap();
+
+        write_live_file(&env, &creds1);
+        write_config_file(&env, &cfg1);
+
+        credentials::write_backup(2, "acct2@test.com", &creds2_expired).unwrap();
+        fs::write(
+            config_backup_path(2, "acct2@test.com"),
+            serde_json::to_string_pretty(&cfg2).unwrap(),
+        )
+        .unwrap();
+
+        // Non-tty: do_switch should warn but still switch successfully.
+        do_switch(2).unwrap();
+
+        assert_eq!(sequence::load().unwrap().active_account_number, Some(2));
+        let live = read_live_json(&env);
+        assert_eq!(
+            live["claudeAiOauth"]["accessToken"].as_str().unwrap(),
+            "sk-ant-oat01-acct2"
+        );
+    }
+
+    /// Switching to a healthy (non-expired) OAuth account takes the normal path
+    /// with no expiry warning.
+    #[test]
+    fn test_do_switch_healthy_oauth_no_expiry_warning() {
+        let env = TestEnv::new();
+        setup_two_oauth(&env); // both accounts have fresh creds
+
+        // Should succeed without any expiry-related branching.
+        do_switch(2).unwrap();
+
+        assert_eq!(sequence::load().unwrap().active_account_number, Some(2));
     }
 }
