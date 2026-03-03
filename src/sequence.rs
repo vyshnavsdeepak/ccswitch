@@ -31,6 +31,8 @@ pub struct SequenceFile {
     pub last_updated: String,
     pub sequence: Vec<u32>,
     pub accounts: HashMap<String, AccountEntry>,
+    #[serde(default)]
+    pub aliases: HashMap<String, u32>,
 }
 
 impl SequenceFile {
@@ -54,16 +56,19 @@ impl SequenceFile {
         self.accounts.values().any(|a| a.email == email)
     }
 
-    /// Resolve an account identifier (number string or email) to an account number.
+    /// Resolve an account identifier (number, email, or alias) to an account number.
     pub fn resolve(&self, identifier: &str) -> Option<u32> {
         if let Ok(num) = identifier.parse::<u32>() {
             if self.accounts.contains_key(&num.to_string()) {
                 return Some(num);
             }
-            None
-        } else {
-            self.find_by_email(identifier)
+            return None;
         }
+        self.find_by_email(identifier).or_else(|| {
+            self.aliases.get(identifier).copied().filter(|num| {
+                self.accounts.contains_key(&num.to_string())
+            })
+        })
     }
 }
 
@@ -203,6 +208,40 @@ mod tests {
         seq.accounts.insert("3".into(), make_entry("user@test.com"));
         assert_eq!(seq.resolve("user@test.com"), Some(3));
         assert_eq!(seq.resolve("other@test.com"), None);
+    }
+
+    #[test]
+    fn test_resolve_by_alias() {
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("2".into(), make_entry("user@test.com"));
+        seq.aliases.insert("work".into(), 2);
+        assert_eq!(seq.resolve("work"), Some(2));
+    }
+
+    #[test]
+    fn test_resolve_alias_unknown() {
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), make_entry("user@test.com"));
+        assert_eq!(seq.resolve("nope"), None);
+    }
+
+    #[test]
+    fn test_resolve_alias_dangling() {
+        // Alias points to a num that no longer exists in accounts
+        let mut seq = SequenceFile::default();
+        seq.aliases.insert("ghost".into(), 99);
+        assert_eq!(seq.resolve("ghost"), None);
+    }
+
+    #[test]
+    fn test_resolve_email_takes_priority_over_alias() {
+        // An alias with the same string as an email should still match by email first
+        let mut seq = SequenceFile::default();
+        seq.accounts.insert("1".into(), make_entry("dup@test.com"));
+        seq.accounts.insert("2".into(), make_entry("other@test.com"));
+        seq.aliases.insert("dup@test.com".into(), 2);
+        // email match for account 1 should win over alias pointing to 2
+        assert_eq!(seq.resolve("dup@test.com"), Some(1));
     }
 
     #[test]
