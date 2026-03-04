@@ -28,6 +28,7 @@
       font-family: monospace;
       font-size: 14px;
       line-height: 1.5;
+      overflow-x: hidden;
     }
 
     a {
@@ -74,7 +75,13 @@
 
     @media (max-width: 640px) {
       .hero { grid-template-columns: 1fr; }
-      .hero-right { border-top: 4px solid var(--black); border-left: none !important; }
+      .hero-left { border-right: none; padding: 24px 16px; }
+      .hero-right { border-top: 4px solid var(--black); border-left: none !important; padding: 24px 16px; }
+    }
+
+    @media (max-width: 580px) {
+      .hero-ascii { display: none; }
+      .hero h1 { font-size: 3rem; }
     }
 
     .hero-left {
@@ -184,13 +191,18 @@
       border-bottom: 4px solid var(--black);
     }
 
-    @media (max-width: 640px) {
+    @media (max-width: 900px) {
       .main-grid { grid-template-columns: 1fr; }
       .main-grid > *:not(:last-child) { border-bottom: 4px solid var(--black); }
+      .main-grid > *:first-child { border-right: none; }
     }
 
     .main-grid > * {
       padding: 32px 28px;
+    }
+
+    @media (max-width: 640px) {
+      .main-grid > * { padding: 24px 16px; }
     }
 
     .main-grid > *:first-child {
@@ -275,7 +287,7 @@
     }
 
     .why-cell {
-      padding: 28px;
+      padding: 24px 20px;
       border-right: 4px solid var(--black);
       border-bottom: 4px solid var(--black);
     }
@@ -284,7 +296,7 @@
     .why-cell:nth-last-child(-n+2) { border-bottom: none; }
 
     @media (max-width: 640px) {
-      .why-cell { border-right: none !important; border-bottom: 4px solid var(--black) !important; }
+      .why-cell { border-right: none !important; border-bottom: 4px solid var(--black) !important; padding: 20px 16px; }
       .why-cell:last-child { border-bottom: none !important; }
     }
 
@@ -312,7 +324,7 @@
     /* ── PLATFORMS ── */
     .platforms-row {
       border-bottom: 4px solid var(--black);
-      padding: 24px 28px;
+      padding: 20px 20px;
       display: flex;
       flex-wrap: wrap;
       gap: 0;
@@ -343,7 +355,8 @@
     }
 
     @media (max-width: 480px) {
-      footer { grid-template-columns: 1fr; gap: 12px; }
+      footer { grid-template-columns: 1fr; gap: 12px; padding: 16px; }
+      .platforms-row { padding: 16px; }
     }
 
     .footer-links {
