@@ -1,18 +1,18 @@
 class Ccswitch < Formula
   desc "Multi-account switcher for Claude Code"
   homepage "https://github.com/vyshnavsdeepak/ccswitch"
-  version "0.1.0"
+  version "0.2.0" # VERSION
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/vyshnavsdeepak/ccswitch/releases/download/v0.1.0/ccswitch-aarch64-apple-darwin.tar.gz"
-      sha256 "13aa687fcc2f79b897b999c808b0cda4821b18995861335bcd4114b67ed9b60e"
+      url "https://github.com/vyshnavsdeepak/ccswitch/releases/download/v0.2.0/ccswitch-aarch64-apple-darwin.tar.gz" # ARM_URL
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # ARM_SHA
     end
 
     on_intel do
-      url "https://github.com/vyshnavsdeepak/ccswitch/releases/download/v0.1.0/ccswitch-x86_64-apple-darwin.tar.gz"
-      sha256 "590f08b238d9d7a7dc3cf45eef64170c0816a37975d11b68de26ca2293e8b7f5"
+      url "https://github.com/vyshnavsdeepak/ccswitch/releases/download/v0.2.0/ccswitch-x86_64-apple-darwin.tar.gz" # X86_URL
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000" # X86_SHA
     end
   end
 
