@@ -555,12 +555,19 @@ pub fn import_gist(id: &str) -> Result<()> {
     do_import(payload)?;
 
     // Delete the gist only after a successful import.
-    let _ = ureq::delete(&url)
+    match ureq::delete(&url)
         .set("Authorization", &format!("Bearer {}", token))
         .set("User-Agent", "ccswitch")
-        .call();
-
-    println!("  {}  Gist deleted.\n", "✓".green().bold());
+        .call()
+    {
+        Ok(_) => println!("  {}  Gist deleted.\n", "✓".green().bold()),
+        Err(e) => eprintln!(
+            "  {}  Could not delete gist {} — remove it manually: {}\n",
+            "⚠".yellow().bold(),
+            id,
+            e
+        ),
+    }
 
     Ok(())
 }
